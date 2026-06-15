@@ -973,9 +973,14 @@ describe("attendance, leave, cost", { concurrency: false }, () => {
       source: "student",
       reason: "身体不适",
       newScheduledDate: "2026-07-01T10:00:00.000",
+      newScheduledEndDate: "2026-07-01T11:30:00.000",
     });
     assert.equal(service.getLesson(auth, lessons[0]!.id).status, "leave");
     assert.equal(service.getLesson(auth, leaveChange.newLessonId).status, "scheduled");
+    assert.equal(
+      service.getLesson(auth, leaveChange.newLessonId).scheduledEndDate,
+      "2026-07-01T11:30:00.000",
+    );
     const rescheduleChange = service.createLessonChange(auth, {
       lessonId: lessons[1]!.id,
       type: "reschedule",

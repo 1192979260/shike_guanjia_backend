@@ -910,9 +910,17 @@ export class AppService {
     const type = assertLessonChangeType(body.type);
     const source = assertLessonChangeSource(body.source);
     const newStart = assertIsoDate(body.newScheduledDate, "newScheduledDate");
+    const requestedNewEnd =
+      body.newScheduledEndDate === undefined || body.newScheduledEndDate === null
+        ? null
+        : assertIsoDate(body.newScheduledEndDate, "newScheduledEndDate");
     if (newStart < new Date())
       throw badRequest("newScheduledDate must not be in the past", [
         { field: "newScheduledDate", message: "新上课时间不能早于当前时间" },
+      ]);
+    if (requestedNewEnd && requestedNewEnd <= newStart)
+      throw badRequest("newScheduledEndDate must be after newScheduledDate", [
+        { field: "newScheduledEndDate", message: "结束时间必须晚于开始时间" },
       ]);
     const originalStart = new Date(lesson.scheduledDate);
     const originalEnd = lesson.scheduledEndDate
@@ -921,7 +929,7 @@ export class AppService {
     const duration = originalEnd
       ? originalEnd.getTime() - originalStart.getTime()
       : 60 * 60 * 1000;
-    const newEnd = new Date(newStart.getTime() + duration);
+    const newEnd = requestedNewEnd ?? new Date(newStart.getTime() + duration);
     const newLesson: Lesson = {
       ...lesson,
       id: this.store.id(),
