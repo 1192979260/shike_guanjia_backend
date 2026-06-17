@@ -1,10 +1,10 @@
 import type { Lesson, LessonTimeSlot, RecurringRule, TrainingClass } from './types.js';
-import { toLocalIso } from './date-time.js';
+import { businessTimestamp, parseBusinessDateTime, toLocalIso } from './date-time.js';
 
 export function generateLessonsForClass(trainingClass: TrainingClass, makeId: () => string, existingManual: Lesson[] = []): Lesson[] {
   const lessons: Lesson[] = [];
-  const start = new Date(trainingClass.startTime);
-  const end = trainingClass.endTime ? new Date(trainingClass.endTime) : addMonths(start, 18);
+  const start = parseBusinessDateTime(trainingClass.startTime, "startTime");
+  const end = trainingClass.endTime ? parseBusinessDateTime(trainingClass.endTime, "endTime") : addMonths(start, 18);
   const max = Math.max(0, trainingClass.totalHours);
   const rule = trainingClass.recurringRule;
   const pushLesson = (date: Date, slot: LessonTimeSlot, isMakeup = false) => {
@@ -41,16 +41,16 @@ export function generateLessonsForClass(trainingClass: TrainingClass, makeId: ()
       }
     }
   }
-  return [...lessons, ...existingManual].sort((a, b) => Date.parse(a.scheduledDate) - Date.parse(b.scheduledDate));
+  return [...lessons, ...existingManual].sort((a, b) => businessTimestamp(a.scheduledDate) - businessTimestamp(b.scheduledDate));
 }
 
 export function findLessonConflicts(target: Lesson, lessons: Lesson[]): Lesson[] {
-  const targetStart = Date.parse(target.scheduledDate);
-  const targetEnd = Date.parse(target.scheduledEndDate ?? target.scheduledDate);
+  const targetStart = businessTimestamp(target.scheduledDate);
+  const targetEnd = businessTimestamp(target.scheduledEndDate ?? target.scheduledDate);
   return lessons.filter((lesson) => {
     if (lesson.id === target.id || lesson.status === 'cancelled') return false;
-    const start = Date.parse(lesson.scheduledDate);
-    const end = Date.parse(lesson.scheduledEndDate ?? lesson.scheduledDate);
+    const start = businessTimestamp(lesson.scheduledDate);
+    const end = businessTimestamp(lesson.scheduledEndDate ?? lesson.scheduledDate);
     return targetStart < end && start < targetEnd;
   });
 }

@@ -12,6 +12,7 @@ import type {
   LeaveRecord,
   Lesson,
   LessonChangeRecord,
+  LessonReminderSubscription,
   ReminderSettings,
   SuspensionPeriod,
   ThemePreference,
@@ -45,6 +46,7 @@ export class MemoryStore implements BackendRepositories {
   authCredentials = new Map<string, AuthCredential>();
   suspensions = new Map<string, SuspensionPeriod>();
   reminderSettings = new Map<string, ReminderSettings>();
+  reminderSubscriptions = new Map<string, LessonReminderSubscription>();
   themePreferences = new Map<string, ThemePreference>();
 
   id() {
@@ -64,8 +66,11 @@ export class MemoryStore implements BackendRepositories {
     this.authCredentials.clear();
     this.suspensions.clear();
     this.reminderSettings.clear();
+    this.reminderSubscriptions.clear();
     this.themePreferences.clear();
   }
+
+  async refresh() {}
 
   async waitForIdle() {}
 }
@@ -83,6 +88,7 @@ interface StoreSnapshot {
   authCredentials: AuthCredential[];
   suspensions: SuspensionPeriod[];
   reminderSettings: ReminderSettings[];
+  reminderSubscriptions: LessonReminderSubscription[];
   themePreferences: ThemePreference[];
 }
 
@@ -164,6 +170,10 @@ export class FileStore extends MemoryStore {
         snapshot.reminderSettings?.map((item) => [item.familyId, item]) ?? [],
         () => this.persist(),
       );
+      this.reminderSubscriptions = new PersistedMap(
+        snapshot.reminderSubscriptions?.map((item) => [item.id, item]) ?? [],
+        () => this.persist(),
+      );
       this.themePreferences = new PersistedMap(
         snapshot.themePreferences?.map((item) => [item.userId, item]) ?? [],
         () => this.persist(),
@@ -187,6 +197,7 @@ export class FileStore extends MemoryStore {
       authCredentials: [...this.authCredentials.values()],
       suspensions: [...this.suspensions.values()],
       reminderSettings: [...this.reminderSettings.values()],
+      reminderSubscriptions: [...this.reminderSubscriptions.values()],
       themePreferences: [...this.themePreferences.values()],
     };
   }
@@ -290,6 +301,11 @@ export class SqliteStore extends MemoryStore {
       (item: ReminderSettings) => item.familyId,
     );
     this.loadCollection(
+      "reminderSubscriptions",
+      this.reminderSubscriptions,
+      (item: LessonReminderSubscription) => item.id,
+    );
+    this.loadCollection(
       "themePreferences",
       this.themePreferences,
       (item: ThemePreference) => item.userId,
@@ -343,6 +359,10 @@ export class SqliteStore extends MemoryStore {
       "reminderSettings",
       this.reminderSettings,
     );
+    this.reminderSubscriptions = this.persistedMap(
+      "reminderSubscriptions",
+      this.reminderSubscriptions,
+    );
     this.themePreferences = this.persistedMap(
       "themePreferences",
       this.themePreferences,
@@ -391,6 +411,7 @@ interface KvRow extends RowDataPacket {
 
 export class MysqlStore extends MemoryStore {
   private pendingWrite: Promise<void> = Promise.resolve();
+  private refreshing = false;
 
   private constructor(private pool: Pool) {
     super();
@@ -412,8 +433,26 @@ export class MysqlStore extends MemoryStore {
   override reset() {
     super.reset();
     this.enqueueWrite(async () => {
+      await this.pool.execute("DELETE FROM lessons");
+      await this.pool.execute("DELETE FROM classes");
+      await this.pool.execute("DELETE FROM children");
+      await this.pool.execute("DELETE FROM family_members");
+      await this.pool.execute("DELETE FROM families");
+      await this.pool.execute("DELETE FROM users");
+      await this.pool.execute("DELETE FROM auth_credentials");
       await this.pool.execute("DELETE FROM kv_store");
     });
+  }
+
+  override async refresh() {
+    if (this.refreshing) return;
+    this.refreshing = true;
+    try {
+      await this.waitForIdle();
+      await this.refreshCoreTables();
+    } finally {
+      this.refreshing = false;
+    }
   }
 
   override async waitForIdle() {
@@ -426,6 +465,8 @@ export class MysqlStore extends MemoryStore {
   }
 
   private async initialize() {
+    await this.createCoreTables();
+    await this.dropCoreForeignKeys();
     await this.pool.execute(`
       CREATE TABLE IF NOT EXISTS kv_store (
         collection VARCHAR(64) NOT NULL,
@@ -434,27 +475,8 @@ export class MysqlStore extends MemoryStore {
         PRIMARY KEY (collection, id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
-    await this.loadCollection("users", this.users, (item: User) => item.id);
-    await this.loadCollection(
-      "families",
-      this.families,
-      (item: Family) => item.id,
-    );
-    await this.loadCollection(
-      "children",
-      this.children,
-      (item: Child) => item.id,
-    );
-    await this.loadCollection(
-      "classes",
-      this.classes,
-      (item: TrainingClass) => item.id,
-    );
-    await this.loadCollection(
-      "lessons",
-      this.lessons,
-      (item: Lesson) => item.id,
-    );
+    await this.migrateCoreCollectionsFromKv();
+    await this.refreshCoreTables();
     await this.loadCollection(
       "attendance",
       this.attendance,
@@ -476,11 +498,6 @@ export class MysqlStore extends MemoryStore {
       (item: Session) => item.token,
     );
     await this.loadCollection(
-      "authCredentials",
-      this.authCredentials,
-      (item: AuthCredential) => item.phone,
-    );
-    await this.loadCollection(
       "suspensions",
       this.suspensions,
       (item: SuspensionPeriod) => item.id,
@@ -491,11 +508,341 @@ export class MysqlStore extends MemoryStore {
       (item: ReminderSettings) => item.familyId,
     );
     await this.loadCollection(
+      "reminderSubscriptions",
+      this.reminderSubscriptions,
+      (item: LessonReminderSubscription) => item.id,
+    );
+    await this.loadCollection(
       "themePreferences",
       this.themePreferences,
       (item: ThemePreference) => item.userId,
     );
-    this.wrapMaps();
+    this.wrapKvMaps();
+  }
+
+  private async createCoreTables() {
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS users (
+        id VARCHAR(191) NOT NULL PRIMARY KEY,
+        phone VARCHAR(32) NOT NULL UNIQUE,
+        nickname VARCHAR(255) NULL,
+        avatar_url TEXT NULL,
+        wechat_openid VARCHAR(191) NULL,
+        created_at VARCHAR(64) NOT NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    await this.addColumnIfMissing("users", "wechat_openid", "VARCHAR(191) NULL");
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS families (
+        id VARCHAR(191) NOT NULL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS family_members (
+        id VARCHAR(191) NOT NULL PRIMARY KEY,
+        family_id VARCHAR(191) NOT NULL,
+        user_id VARCHAR(191) NOT NULL UNIQUE,
+        relation VARCHAR(32) NOT NULL,
+        display_name VARCHAR(255) NULL,
+        created_at VARCHAR(64) NOT NULL,
+        INDEX idx_family_members_family_id (family_id),
+        INDEX idx_family_members_user_id (user_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS children (
+        id VARCHAR(191) NOT NULL PRIMARY KEY,
+        family_id VARCHAR(191) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        age INT NULL,
+        avatar_url TEXT NULL,
+        created_at VARCHAR(64) NOT NULL,
+        INDEX idx_children_family_id (family_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS classes (
+        id VARCHAR(191) NOT NULL PRIMARY KEY,
+        child_id VARCHAR(191) NOT NULL,
+        family_id VARCHAR(191) NOT NULL,
+        institution_name VARCHAR(255) NOT NULL,
+        class_name VARCHAR(255) NOT NULL,
+        course_name VARCHAR(255) NOT NULL,
+        teacher_name VARCHAR(255) NULL,
+        teacher_phone VARCHAR(32) NULL,
+        total_hours DOUBLE NOT NULL,
+        used_hours DOUBLE NOT NULL,
+        remaining_hours DOUBLE NOT NULL,
+        total_fee DOUBLE NOT NULL,
+        start_time VARCHAR(64) NOT NULL,
+        end_time VARCHAR(64) NULL,
+        recurring_rule JSON NOT NULL,
+        status VARCHAR(32) NOT NULL,
+        created_at VARCHAR(64) NOT NULL,
+        updated_at VARCHAR(64) NULL,
+        notes TEXT NULL,
+        INDEX idx_classes_family_id (family_id),
+        INDEX idx_classes_child_id (child_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS lessons (
+        id VARCHAR(191) NOT NULL PRIMARY KEY,
+        class_id VARCHAR(191) NOT NULL,
+        scheduled_date VARCHAR(64) NOT NULL,
+        scheduled_end_date VARCHAR(64) NULL,
+        status VARCHAR(32) NOT NULL,
+        actual_date VARCHAR(64) NULL,
+        checkin_time VARCHAR(64) NULL,
+        is_makeup BOOLEAN NOT NULL DEFAULT FALSE,
+        notes TEXT NULL,
+        leave_reason TEXT NULL,
+        is_manual BOOLEAN NULL,
+        INDEX idx_lessons_class_id (class_id),
+        INDEX idx_lessons_scheduled_date (scheduled_date)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS auth_credentials (
+        phone VARCHAR(32) NOT NULL PRIMARY KEY,
+        password_hash VARCHAR(255) NOT NULL,
+        salt VARCHAR(255) NOT NULL,
+        created_at VARCHAR(64) NOT NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+  }
+
+  private async dropCoreForeignKeys() {
+    await this.dropForeignKeyIfExists("family_members", "fk_family_members_family");
+    await this.dropForeignKeyIfExists("family_members", "fk_family_members_user");
+    await this.dropForeignKeyIfExists("children", "fk_children_family");
+    await this.dropForeignKeyIfExists("classes", "fk_classes_family");
+    await this.dropForeignKeyIfExists("classes", "fk_classes_child");
+    await this.dropForeignKeyIfExists("lessons", "fk_lessons_class");
+  }
+
+  private async dropForeignKeyIfExists(table: string, constraint: string) {
+    try {
+      await this.pool.execute(`ALTER TABLE ${table} DROP FOREIGN KEY ${constraint}`);
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code !== "ER_CANT_DROP_FIELD_OR_KEY") throw error;
+    }
+  }
+
+  private async addColumnIfMissing(table: string, column: string, definition: string) {
+    try {
+      await this.pool.execute(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code !== "ER_DUP_FIELDNAME") throw error;
+    }
+  }
+
+  private async migrateCoreCollectionsFromKv() {
+    const users = await this.loadKvCollection<User>("users");
+    const families = await this.loadKvCollection<Family>("families");
+    const children = await this.loadKvCollection<Child>("children");
+    const classes = await this.loadKvCollection<TrainingClass>("classes");
+    const lessons = await this.loadKvCollection<Lesson>("lessons");
+    const authCredentials =
+      await this.loadKvCollection<AuthCredential>("authCredentials");
+
+    for (const item of users) await this.setCoreRecordNow("users", item.id, item);
+
+    const referencedFamilyIds = new Set<string>([
+      ...children.map((item) => item.familyId),
+      ...classes.map((item) => item.familyId),
+    ]);
+    const orderedFamilies = [...families].sort((a, b) => {
+      const aReferenced = referencedFamilyIds.has(a.id);
+      const bReferenced = referencedFamilyIds.has(b.id);
+      return Number(aReferenced) - Number(bReferenced);
+    });
+    for (const item of orderedFamilies)
+      await this.setCoreRecordNow("families", item.id, item);
+
+    for (const item of children)
+      await this.setCoreRecordNow("children", item.id, item);
+    for (const item of classes)
+      await this.setCoreRecordNow("classes", item.id, item);
+    for (const item of lessons)
+      await this.setCoreRecordNow("lessons", item.id, item);
+    for (const item of authCredentials)
+      await this.setCoreRecordNow("authCredentials", item.phone, item);
+  }
+
+  private async loadKvCollection<T>(collection: string) {
+    const [rows] = await this.pool.query<KvRow[]>(
+      "SELECT value FROM kv_store WHERE collection = ?",
+      [collection],
+    );
+    return rows.map(
+      (row) => normalizeStoredDates(parseStoredValue(row.value)) as T,
+    );
+  }
+
+  private async refreshCoreTables() {
+    const users = await this.loadUsersTable();
+    const families = await this.loadFamiliesTable();
+    const children = await this.loadChildrenTable();
+    const classes = await this.loadClassesTable();
+    const lessons = await this.loadLessonsTable();
+    const authCredentials = await this.loadAuthCredentialsTable();
+
+    this.users = this.persistedMap("users", users);
+    this.families = this.persistedMap("families", families);
+    this.children = this.persistedMap("children", children);
+    this.classes = this.persistedMap("classes", classes);
+    this.lessons = this.persistedMap("lessons", lessons);
+    this.authCredentials = this.persistedMap(
+      "authCredentials",
+      authCredentials,
+    );
+  }
+
+  private async loadUsersTable() {
+    const [rows] = await this.pool.query<RowDataPacket[]>("SELECT * FROM users");
+    return new Map(
+      rows.map((row) => [
+        String(row.id),
+        normalizeStoredDates({
+          id: row.id,
+          phone: row.phone,
+          nickname: row.nickname,
+          avatarUrl: row.avatar_url,
+          wechatOpenid: row.wechat_openid,
+          createdAt: row.created_at,
+        }) as User,
+      ]),
+    );
+  }
+
+  private async loadFamiliesTable() {
+    const [familyRows] = await this.pool.query<RowDataPacket[]>(
+      "SELECT * FROM families",
+    );
+    const [memberRows] = await this.pool.query<RowDataPacket[]>(
+      "SELECT * FROM family_members ORDER BY created_at ASC",
+    );
+    const families = new Map<string, Family>();
+    for (const row of familyRows) {
+      families.set(String(row.id), {
+        id: row.id,
+        name: row.name,
+        members: [],
+      });
+    }
+    for (const row of memberRows) {
+      const family = families.get(String(row.family_id));
+      if (!family) continue;
+      family.members.push(
+        normalizeStoredDates({
+          id: row.id,
+          userId: row.user_id,
+          relation: row.relation,
+          displayName: row.display_name,
+          createdAt: row.created_at,
+        }) as Family["members"][number],
+      );
+    }
+    return families;
+  }
+
+  private async loadChildrenTable() {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      "SELECT * FROM children",
+    );
+    return new Map(
+      rows.map((row) => [
+        String(row.id),
+        normalizeStoredDates({
+          id: row.id,
+          name: row.name,
+          age: row.age,
+          avatarUrl: row.avatar_url,
+          familyId: row.family_id,
+          createdAt: row.created_at,
+        }) as Child,
+      ]),
+    );
+  }
+
+  private async loadClassesTable() {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      "SELECT * FROM classes",
+    );
+    return new Map(
+      rows.map((row) => [
+        String(row.id),
+        normalizeStoredDates({
+          id: row.id,
+          childId: row.child_id,
+          familyId: row.family_id,
+          institutionName: row.institution_name,
+          className: row.class_name,
+          courseName: row.course_name,
+          teacherName: row.teacher_name,
+          teacherPhone: row.teacher_phone,
+          totalHours: Number(row.total_hours),
+          usedHours: Number(row.used_hours),
+          remainingHours: Number(row.remaining_hours),
+          totalFee: Number(row.total_fee),
+          startTime: row.start_time,
+          endTime: row.end_time,
+          recurringRule: parseStoredValue(row.recurring_rule),
+          status: row.status,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at,
+          notes: row.notes,
+        }) as TrainingClass,
+      ]),
+    );
+  }
+
+  private async loadLessonsTable() {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      "SELECT * FROM lessons",
+    );
+    return new Map(
+      rows.map((row) => [
+        String(row.id),
+        normalizeStoredDates({
+          id: row.id,
+          classId: row.class_id,
+          scheduledDate: row.scheduled_date,
+          scheduledEndDate: row.scheduled_end_date,
+          status: row.status,
+          actualDate: row.actual_date,
+          checkinTime: row.checkin_time,
+          isMakeup: Boolean(row.is_makeup),
+          notes: row.notes,
+          leaveReason: row.leave_reason,
+          isManual:
+            row.is_manual === null || row.is_manual === undefined
+              ? undefined
+              : Boolean(row.is_manual),
+        }) as Lesson,
+      ]),
+    );
+  }
+
+  private async loadAuthCredentialsTable() {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      "SELECT * FROM auth_credentials",
+    );
+    return new Map(
+      rows.map((row) => [
+        String(row.phone),
+        {
+          phone: row.phone,
+          passwordHash: row.password_hash,
+          salt: row.salt,
+          createdAt: row.created_at,
+        } as AuthCredential,
+      ]),
+    );
   }
 
   private async loadCollection<T>(
@@ -513,12 +860,7 @@ export class MysqlStore extends MemoryStore {
     }
   }
 
-  private wrapMaps() {
-    this.users = this.persistedMap("users", this.users);
-    this.families = this.persistedMap("families", this.families);
-    this.children = this.persistedMap("children", this.children);
-    this.classes = this.persistedMap("classes", this.classes);
-    this.lessons = this.persistedMap("lessons", this.lessons);
+  private wrapKvMaps() {
     this.attendance = this.persistedMap("attendance", this.attendance);
     this.leaves = this.persistedMap("leaves", this.leaves);
     this.lessonChanges = this.persistedMap(
@@ -526,14 +868,14 @@ export class MysqlStore extends MemoryStore {
       this.lessonChanges,
     );
     this.sessions = this.persistedMap("sessions", this.sessions);
-    this.authCredentials = this.persistedMap(
-      "authCredentials",
-      this.authCredentials,
-    );
     this.suspensions = this.persistedMap("suspensions", this.suspensions);
     this.reminderSettings = this.persistedMap(
       "reminderSettings",
       this.reminderSettings,
+    );
+    this.reminderSubscriptions = this.persistedMap(
+      "reminderSubscriptions",
+      this.reminderSubscriptions,
     );
     this.themePreferences = this.persistedMap(
       "themePreferences",
@@ -552,6 +894,12 @@ export class MysqlStore extends MemoryStore {
 
   private persistCollection<T>(collection: string, source: Map<string, T>) {
     this.enqueueWrite(async () => {
+      if (this.isCoreCollection(collection)) {
+        await this.deleteCoreCollectionNow(collection);
+        for (const [key, value] of source.entries())
+          await this.setCoreRecordNow(collection, key, value);
+        return;
+      }
       await this.pool.execute("DELETE FROM kv_store WHERE collection = ?", [
         collection,
       ]);
@@ -561,7 +909,11 @@ export class MysqlStore extends MemoryStore {
   }
 
   private setRecord<T>(collection: string, key: string, value: T) {
-    this.enqueueWrite(() => this.setRecordNow(collection, key, value));
+    this.enqueueWrite(() =>
+      this.isCoreCollection(collection)
+        ? this.setCoreRecordNow(collection, key, value)
+        : this.setRecordNow(collection, key, value),
+    );
   }
 
   private async setRecordNow<T>(collection: string, key: string, value: T) {
@@ -573,11 +925,244 @@ export class MysqlStore extends MemoryStore {
 
   private deleteRecord(collection: string, key: string) {
     this.enqueueWrite(async () => {
+      if (this.isCoreCollection(collection)) {
+        await this.deleteCoreRecordNow(collection, key);
+        return;
+      }
       await this.pool.execute(
         "DELETE FROM kv_store WHERE collection = ? AND id = ?",
         [collection, key],
       );
     });
+  }
+
+  private isCoreCollection(collection: string) {
+    return (
+      collection === "users" ||
+      collection === "families" ||
+      collection === "children" ||
+      collection === "classes" ||
+      collection === "lessons" ||
+      collection === "authCredentials"
+    );
+  }
+
+  private async deleteCoreCollectionNow(collection: string) {
+    const table = this.coreTableName(collection);
+    await this.pool.execute(`DELETE FROM ${table}`);
+  }
+
+  private async deleteCoreRecordNow(collection: string, key: string) {
+    if (collection === "authCredentials") {
+      await this.pool.execute("DELETE FROM auth_credentials WHERE phone = ?", [
+        key,
+      ]);
+      return;
+    }
+    await this.pool.execute(`DELETE FROM ${this.coreTableName(collection)} WHERE id = ?`, [
+      key,
+    ]);
+  }
+
+  private coreTableName(collection: string) {
+    switch (collection) {
+      case "users":
+        return "users";
+      case "families":
+        return "families";
+      case "children":
+        return "children";
+      case "classes":
+        return "classes";
+      case "lessons":
+        return "lessons";
+      case "authCredentials":
+        return "auth_credentials";
+      default:
+        throw new Error(`Unknown core collection: ${collection}`);
+    }
+  }
+
+  private async setCoreRecordNow<T>(
+    collection: string,
+    key: string,
+    value: T,
+  ) {
+    if (collection === "users") {
+      const item = value as User;
+      await this.pool.execute(
+        `INSERT INTO users (id, phone, nickname, avatar_url, wechat_openid, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           phone = VALUES(phone),
+           nickname = VALUES(nickname),
+           avatar_url = VALUES(avatar_url),
+           wechat_openid = VALUES(wechat_openid),
+           created_at = VALUES(created_at)`,
+        [
+          item.id,
+          item.phone,
+          item.nickname ?? null,
+          item.avatarUrl ?? null,
+          item.wechatOpenid ?? null,
+          item.createdAt,
+        ],
+      );
+      return;
+    }
+    if (collection === "families") {
+      const item = value as Family;
+      await this.pool.execute(
+        `INSERT INTO families (id, name)
+         VALUES (?, ?)
+         ON DUPLICATE KEY UPDATE name = VALUES(name)`,
+        [item.id, item.name],
+      );
+      await this.pool.execute("DELETE FROM family_members WHERE family_id = ?", [
+        item.id,
+      ]);
+      for (const member of item.members) {
+        await this.pool.execute(
+          `INSERT INTO family_members
+             (id, family_id, user_id, relation, display_name, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE
+             family_id = VALUES(family_id),
+             relation = VALUES(relation),
+             display_name = VALUES(display_name),
+             created_at = VALUES(created_at)`,
+          [
+            member.id,
+            item.id,
+            member.userId,
+            member.relation,
+            member.displayName ?? null,
+            member.createdAt,
+          ],
+        );
+      }
+      return;
+    }
+    if (collection === "children") {
+      const item = value as Child;
+      await this.pool.execute(
+        `INSERT INTO children (id, family_id, name, age, avatar_url, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           family_id = VALUES(family_id),
+           name = VALUES(name),
+           age = VALUES(age),
+           avatar_url = VALUES(avatar_url),
+           created_at = VALUES(created_at)`,
+        [
+          item.id,
+          item.familyId,
+          item.name,
+          item.age ?? null,
+          item.avatarUrl ?? null,
+          item.createdAt,
+        ],
+      );
+      return;
+    }
+    if (collection === "classes") {
+      const item = value as TrainingClass;
+      await this.pool.execute(
+        `INSERT INTO classes
+          (id, child_id, family_id, institution_name, class_name, course_name,
+           teacher_name, teacher_phone, total_hours, used_hours,
+           remaining_hours, total_fee, start_time, end_time, recurring_rule,
+           status, created_at, updated_at, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           child_id = VALUES(child_id),
+           family_id = VALUES(family_id),
+           institution_name = VALUES(institution_name),
+           class_name = VALUES(class_name),
+           course_name = VALUES(course_name),
+           teacher_name = VALUES(teacher_name),
+           teacher_phone = VALUES(teacher_phone),
+           total_hours = VALUES(total_hours),
+           used_hours = VALUES(used_hours),
+           remaining_hours = VALUES(remaining_hours),
+           total_fee = VALUES(total_fee),
+           start_time = VALUES(start_time),
+           end_time = VALUES(end_time),
+           recurring_rule = VALUES(recurring_rule),
+           status = VALUES(status),
+           created_at = VALUES(created_at),
+           updated_at = VALUES(updated_at),
+           notes = VALUES(notes)`,
+        [
+          item.id,
+          item.childId,
+          item.familyId,
+          item.institutionName,
+          item.className,
+          item.courseName,
+          item.teacherName ?? null,
+          item.teacherPhone ?? null,
+          item.totalHours,
+          item.usedHours,
+          item.remainingHours,
+          item.totalFee,
+          item.startTime,
+          item.endTime ?? null,
+          JSON.stringify(item.recurringRule),
+          item.status,
+          item.createdAt,
+          item.updatedAt ?? null,
+          item.notes ?? null,
+        ],
+      );
+      return;
+    }
+    if (collection === "lessons") {
+      const item = value as Lesson;
+      await this.pool.execute(
+        `INSERT INTO lessons
+          (id, class_id, scheduled_date, scheduled_end_date, status,
+           actual_date, checkin_time, is_makeup, notes, leave_reason, is_manual)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           class_id = VALUES(class_id),
+           scheduled_date = VALUES(scheduled_date),
+           scheduled_end_date = VALUES(scheduled_end_date),
+           status = VALUES(status),
+           actual_date = VALUES(actual_date),
+           checkin_time = VALUES(checkin_time),
+           is_makeup = VALUES(is_makeup),
+           notes = VALUES(notes),
+           leave_reason = VALUES(leave_reason),
+           is_manual = VALUES(is_manual)`,
+        [
+          item.id,
+          item.classId,
+          item.scheduledDate,
+          item.scheduledEndDate ?? null,
+          item.status,
+          item.actualDate ?? null,
+          item.checkinTime ?? null,
+          item.isMakeup,
+          item.notes ?? null,
+          item.leaveReason ?? null,
+          item.isManual ?? null,
+        ],
+      );
+      return;
+    }
+    if (collection === "authCredentials") {
+      const item = value as AuthCredential;
+      await this.pool.execute(
+        `INSERT INTO auth_credentials (phone, password_hash, salt, created_at)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           password_hash = VALUES(password_hash),
+           salt = VALUES(salt),
+           created_at = VALUES(created_at)`,
+        [item.phone, item.passwordHash, item.salt, item.createdAt],
+      );
+    }
   }
 
   private enqueueWrite(task: () => Promise<void>) {

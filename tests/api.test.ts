@@ -3,6 +3,7 @@ import { rmSync } from "node:fs";
 import { beforeEach, describe, it } from "node:test";
 import { AppService } from "../src/app-service.js";
 import { loadConfig } from "../src/config.js";
+import { parseBusinessDateTime, toLocalIso } from "../src/date-time.js";
 import {
   findLessonConflicts,
   generateLessonsForClass,
@@ -76,6 +77,12 @@ function lessonOn(
 }
 
 describe("auth and family", { concurrency: false }, () => {
+  it("parses local business datetime strings independently from server timezone", () => {
+    const parsed = parseBusinessDateTime("2026-06-17T16:10:00.000");
+    assert.equal(parsed.toISOString(), "2026-06-17T08:10:00.000Z");
+    assert.equal(toLocalIso(parsed), "2026-06-17T16:10:00.000");
+  });
+
   it("creates user and family on first login", () => {
     const me = service.me(auth);
     assert.equal(me.user.phone, "13800138000");
@@ -286,6 +293,61 @@ describe("auth and family", { concurrency: false }, () => {
           {
             field: "advanceMinutes",
             message: "提醒时间只能是15、30、60、120或1440分钟",
+          },
+        ]);
+        return true;
+      },
+    );
+  });
+
+  it("binds wechat openid and registers one pending lesson reminder subscription", async () => {
+    const restoreNow = mockNow("2026-06-15T08:00:00.000");
+    try {
+      await service.bindWeChatSession(auth, { openid: "openid-test" });
+      assert.equal(store.users.get(auth.user.id)?.wechatOpenid, "openid-test");
+
+      const child = service.createChild(auth, { name: "小宝" });
+      const trainingClass = service.createClass(auth, {
+        childId: child.id,
+        institutionName: "星星美术",
+        className: "大班A",
+        courseName: "美术启蒙",
+        totalHours: 2,
+        totalFee: 200,
+        startTime: "2026-06-15T09:00:00.000",
+        recurringRule: rule,
+      });
+      const lesson = service.getClassLessons(auth, trainingClass.id)[0]!;
+      const result = service.registerLessonReminders(auth, {
+        templateId: "pluT-ikzv-p5mBwXhcWIApzQqe4eyYQVyKlhha0h1b4",
+        advanceMinutes: 30,
+        lessonIds: [lesson.id],
+        page: `/pages/class-detail/index?classId=${trainingClass.id}`,
+      });
+
+      assert.deepEqual(result.subscribedLessonIds, [lesson.id]);
+      const subscription = [...store.reminderSubscriptions.values()][0]!;
+      assert.equal(subscription.status, "pending");
+      assert.equal(subscription.userId, auth.user.id);
+      assert.equal(subscription.lessonId, lesson.id);
+      assert.equal(subscription.remindAt, "2026-06-15T08:30:00.000");
+    } finally {
+      restoreNow();
+    }
+  });
+
+  it("rejects registering multiple lessons from one subscribe authorization", () => {
+    assert.throws(
+      () =>
+        service.registerLessonReminders(auth, {
+          lessonIds: ["lesson-1", "lesson-2"],
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: string }).code, "BAD_REQUEST");
+        assert.deepEqual((error as { fields?: unknown }).fields, [
+          {
+            field: "lessonIds",
+            message: "一次订阅授权只能登记一节课提醒",
           },
         ]);
         return true;

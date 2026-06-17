@@ -1,3 +1,4 @@
+import { parseBusinessDateTime } from "./date-time.js";
 import { badRequest } from './errors.js';
 import type { LessonTimeSlot, RecurringRule, ThemeSkin } from './types.js';
 
@@ -45,7 +46,7 @@ export function assertChildInput(input: Record<string, unknown>) {
 
 export function assertIsoDate(value: unknown, field: string): Date {
   if (typeof value !== 'string') throw badRequest('Validation failed', [{ field, message: `${field}必须是日期字符串` }]);
-  const date = new Date(value);
+  const date = parseBusinessDateTime(value, field);
   if (Number.isNaN(date.getTime())) throw badRequest('Validation failed', [{ field, message: `${field}日期格式不正确` }]);
   return date;
 }

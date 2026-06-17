@@ -8,7 +8,7 @@
 - Start dev server: `npm run dev`
 - Run checks: `npm test && npm run typecheck`
 - Default persistence: SQLite at `.data/shike-guanjia.sqlite`.
-- Storage override: `STORAGE_MODE=mysql DATABASE_URL=mysql://...` for CloudBase Run / production MySQL, `STORAGE_MODE=memory` for ephemeral test data, or `STORAGE_MODE=file DATA_FILE=.data/shike-guanjia.json` for JSON-file storage.
+- Storage override: `STORAGE_MODE=mysql DATABASE_URL=mysql://...` for CloudBase Run / production MySQL, `STORAGE_MODE=memory` for ephemeral test data, or `STORAGE_MODE=file DATA_FILE=.data/shike-guanjia.json` for JSON-file storage. MySQL stores users, families, family members, children, classes, lessons, and auth credentials in normalized tables; secondary records remain in `kv_store`.
 - SQLite file override: `SQLITE_FILE=.data/custom.sqlite`
 - Auth header: `Authorization: Bearer <token>`
 - JSON response envelope: successful JSON endpoints return `{ "data": ... }`; errors return `{ "error": { "code", "message", "fields" } }`.

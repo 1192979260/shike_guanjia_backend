@@ -4,8 +4,15 @@ import {
   scryptSync,
   timingSafeEqual,
 } from "node:crypto";
+import { lookup as dnsLookup } from "node:dns";
+import { request as httpsRequest } from "node:https";
 import type { Config } from "./config.js";
-import { nowLocalIso, toLocalIso } from "./date-time.js";
+import {
+  businessTimestamp,
+  nowLocalIso,
+  parseBusinessDateTime,
+  toLocalIso,
+} from "./date-time.js";
 import {
   badRequest,
   businessError,
@@ -25,6 +32,7 @@ import type {
   LessonChangeRecord,
   LessonChangeSource,
   LessonChangeType,
+  LessonReminderSubscription,
   MonthlyCostStatistics,
   ReminderSettings,
   ThemePreference,
@@ -49,6 +57,25 @@ import {
 const CHECKIN_EARLY_WINDOW_MS = 15 * 60 * 1000;
 const CHECKIN_LATE_WINDOW_MS = 2 * 60 * 60 * 1000;
 const BACKDATED_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+let cachedWechatAccessToken:
+  | { token: string; expiresAt: number }
+  | undefined;
+
+interface WeChatErrorBody {
+  errcode?: number;
+  errmsg?: string;
+}
+
+interface JsonResponse<T> {
+  status: number;
+  body: T;
+}
+
+interface JsonRequestOptions {
+  method?: "GET" | "POST";
+  body?: unknown;
+}
 
 export interface AuthContext {
   user: User;
@@ -249,6 +276,164 @@ export class AppService {
     };
     this.store.reminderSettings.set(ctx.familyId, updated);
     return updated;
+  }
+
+  async bindWeChatSession(ctx: AuthContext, body: Record<string, unknown>) {
+    const openidFromBody = optionalString(body.openid);
+    if (openidFromBody && this.config.nodeEnv === "production") {
+      throw badRequest("openid cannot be provided directly in production", [
+        { field: "openid", message: "生产环境必须使用微信登录凭证换取 openid" },
+      ]);
+    }
+    const openid =
+      openidFromBody ??
+      (await this.fetchWeChatOpenid(assertString(body.code, "code", "登录凭证", 512)));
+    const updated: User = {
+      ...ctx.user,
+      wechatOpenid: openid,
+    };
+    this.store.users.set(updated.id, updated);
+    return { openidBound: true };
+  }
+
+  registerLessonReminders(ctx: AuthContext, body: Record<string, unknown>) {
+    const templateId =
+      optionalString(body.templateId) ?? this.config.lessonReminderTemplateId;
+    if (templateId !== this.config.lessonReminderTemplateId) {
+      throw badRequest("Invalid lesson reminder templateId", [
+        { field: "templateId", message: "提醒模板ID与服务端配置不一致" },
+      ]);
+    }
+
+    const lessonIds = Array.isArray(body.lessonIds)
+      ? body.lessonIds.map((item) => assertString(item, "lessonIds", "课次ID", 191))
+      : [];
+    if (lessonIds.length !== 1) {
+      throw badRequest("Exactly one lessonId is required", [
+        { field: "lessonIds", message: "一次订阅授权只能登记一节课提醒" },
+      ]);
+    }
+
+    const settings = this.getReminderSettings(ctx);
+    if (!settings.enabled) {
+      throw businessError("REMINDER_DISABLED", "请先启用提醒");
+    }
+
+    const advanceMinutes =
+      optionalReminderAdvanceMinutes(body.advanceMinutes) ??
+      settings.advanceMinutes;
+    const lesson = this.requireLesson(ctx, lessonIds[0]!);
+    if (lesson.status !== "scheduled") {
+      throw badRequest("Only scheduled lessons can be subscribed", [
+        { field: "lessonIds", message: "只能订阅待上课课次" },
+      ]);
+    }
+    if (!settings.includeMakeupLessons && lesson.isMakeup) {
+      throw badRequest("Makeup lessons are excluded by reminder settings", [
+        { field: "lessonIds", message: "当前设置不包含补录课程" },
+      ]);
+    }
+    const scheduledAt = parseBusinessDateTime(
+      lesson.scheduledDate,
+      "scheduledDate",
+    );
+    if (scheduledAt.getTime() <= Date.now()) {
+      throw badRequest("Cannot subscribe a past lesson", [
+        { field: "lessonIds", message: "不能订阅已开始或已结束课次" },
+      ]);
+    }
+    const remindAt = new Date(scheduledAt.getTime() - advanceMinutes * 60_000);
+    const existing = [...this.store.reminderSubscriptions.values()].find(
+      (item) =>
+        item.userId === ctx.user.id &&
+        item.lessonId === lesson.id &&
+        item.templateId === templateId &&
+        item.status === "pending",
+    );
+    const now = nowIso();
+    const subscription: LessonReminderSubscription = {
+      id: existing?.id ?? this.store.id(),
+      familyId: ctx.familyId,
+      userId: ctx.user.id,
+      lessonId: lesson.id,
+      templateId,
+      advanceMinutes,
+      scheduledAt: lesson.scheduledDate,
+      remindAt: toLocalIso(remindAt),
+      page: optionalString(body.page) ?? `/pages/class-detail/index?classId=${lesson.classId}`,
+      status: "pending",
+      sentAt: null,
+      failureReason: null,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    this.store.reminderSubscriptions.set(subscription.id, subscription);
+    return {
+      subscribedLessonIds: [lesson.id],
+      subscriptionIds: [subscription.id],
+      updatedAt: now,
+    };
+  }
+
+  async processDueLessonReminders(now = new Date()) {
+    const due = [...this.store.reminderSubscriptions.values()]
+      .filter(
+        (item) =>
+          item.status === "pending" &&
+          businessTimestamp(item.remindAt) <= now.getTime(),
+      )
+      .sort(
+        (a, b) =>
+          businessTimestamp(a.remindAt) - businessTimestamp(b.remindAt),
+      );
+    let sent = 0;
+    let failed = 0;
+
+    for (const subscription of due) {
+      const user = this.store.users.get(subscription.userId);
+      const lesson = this.store.lessons.get(subscription.lessonId);
+      const trainingClass = lesson
+        ? this.store.classes.get(lesson.classId)
+        : undefined;
+      if (!user?.wechatOpenid) {
+        this.failReminderSubscription(subscription, "用户未绑定微信 openid");
+        failed += 1;
+        continue;
+      }
+      if (!lesson || !trainingClass || lesson.status !== "scheduled") {
+        this.failReminderSubscription(subscription, "课次已不存在或不是待上课状态");
+        failed += 1;
+        continue;
+      }
+      const settings =
+        this.store.reminderSettings.get(subscription.familyId) ??
+        defaultReminderSettings(subscription.familyId);
+      if (!settings.enabled) {
+        this.failReminderSubscription(subscription, "提醒设置已关闭");
+        failed += 1;
+        continue;
+      }
+
+      try {
+        await this.sendLessonReminder(user.wechatOpenid, subscription, lesson, trainingClass);
+        this.store.reminderSubscriptions.set(subscription.id, {
+          ...subscription,
+          status: "sent",
+          sentAt: nowIso(),
+          failureReason: null,
+          updatedAt: nowIso(),
+        });
+        sent += 1;
+      } catch (error) {
+        this.failReminderSubscription(
+          subscription,
+          error instanceof Error ? error.message : "微信订阅消息发送失败",
+        );
+        failed += 1;
+      }
+    }
+
+    return { scanned: due.length, sent, failed };
   }
 
   getThemePreference(ctx: AuthContext) {
@@ -523,7 +708,7 @@ export class AppService {
     return this.familyLessons(ctx)
       .filter((lesson) => {
         const trainingClass = this.store.classes.get(lesson.classId);
-        const date = new Date(lesson.scheduledDate);
+        const date = parseBusinessDateTime(lesson.scheduledDate);
         return (
           date >= start &&
           date <= end &&
@@ -547,7 +732,7 @@ export class AppService {
     return this.familyLessons(ctx)
       .filter((lesson) => {
         const trainingClass = this.store.classes.get(lesson.classId);
-        const date = new Date(lesson.scheduledDate);
+        const date = parseBusinessDateTime(lesson.scheduledDate);
         return (
           lesson.status === "scheduled" &&
           date >= start &&
@@ -612,9 +797,12 @@ export class AppService {
         { field: "scheduledDate", message: "已打卡课次不能调整计划时间" },
       ]);
     }
-    const currentStart = new Date(lesson.scheduledDate);
+    const currentStart = parseBusinessDateTime(
+      lesson.scheduledDate,
+      "scheduledDate",
+    );
     const currentEnd = lesson.scheduledEndDate
-      ? new Date(lesson.scheduledEndDate)
+      ? parseBusinessDateTime(lesson.scheduledEndDate, "scheduledEndDate")
       : inferLessonEndDate(trainingClass, currentStart);
     const scheduledDate =
       body.scheduledDate === undefined
@@ -727,9 +915,12 @@ export class AppService {
       throw badRequest("Cannot check in a cancelled lesson");
     const type = body.type === "backdated" ? "backdated" : "checkin";
     const now = new Date();
-    const scheduledStart = new Date(lesson.scheduledDate);
+    const scheduledStart = parseBusinessDateTime(
+      lesson.scheduledDate,
+      "scheduledDate",
+    );
     const scheduledEnd = lesson.scheduledEndDate
-      ? new Date(lesson.scheduledEndDate)
+      ? parseBusinessDateTime(lesson.scheduledEndDate, "scheduledEndDate")
       : inferLessonEndDate(trainingClass, scheduledStart);
     if (!scheduledEnd)
       throw badRequest("Lesson has no scheduled end time", [
@@ -789,7 +980,8 @@ export class AppService {
     if (
       actualStartTime &&
       actualEndTime &&
-      new Date(actualEndTime) <= new Date(actualStartTime)
+      parseBusinessDateTime(actualEndTime, "actualEndTime") <=
+        parseBusinessDateTime(actualStartTime, "actualStartTime")
     ) {
       throw badRequest("actualEndTime must be after actualStartTime", [
         { field: "actualEndTime", message: "实际结束时间必须晚于实际开始时间" },
@@ -859,7 +1051,7 @@ export class AppService {
     const childId = query.get("childId");
     const classId = query.get("classId");
     return [...this.store.attendance.values()].filter((item) => {
-      const date = new Date(item.checkinTime);
+      const date = parseBusinessDateTime(item.checkinTime, "checkinTime");
       return (
         date >= start &&
         date <= end &&
@@ -875,8 +1067,8 @@ export class AppService {
     return this.familyLessons(ctx)
       .filter(
         (lesson) =>
-          Date.parse(lesson.scheduledDate) < Date.now() &&
-          Date.parse(lesson.scheduledDate) >= since &&
+          businessTimestamp(lesson.scheduledDate) < Date.now() &&
+          businessTimestamp(lesson.scheduledDate) >= since &&
           lesson.status === "scheduled" &&
           ![...this.store.attendance.values()].some(
             (item) => item.lessonId === lesson.id,
@@ -922,9 +1114,12 @@ export class AppService {
       throw badRequest("newScheduledEndDate must be after newScheduledDate", [
         { field: "newScheduledEndDate", message: "结束时间必须晚于开始时间" },
       ]);
-    const originalStart = new Date(lesson.scheduledDate);
+    const originalStart = parseBusinessDateTime(
+      lesson.scheduledDate,
+      "scheduledDate",
+    );
     const originalEnd = lesson.scheduledEndDate
-      ? new Date(lesson.scheduledEndDate)
+      ? parseBusinessDateTime(lesson.scheduledEndDate, "scheduledEndDate")
       : inferLessonEndDate(trainingClass, originalStart);
     const duration = originalEnd
       ? originalEnd.getTime() - originalStart.getTime()
@@ -986,14 +1181,14 @@ export class AppService {
   lessonChangeHistory(ctx: AuthContext, query: URLSearchParams) {
     const childId = query.get("childId");
     const start = query.get("startDate")
-      ? new Date(query.get("startDate") as string)
+      ? parseBusinessDateTime(query.get("startDate") as string, "startDate")
       : null;
     const end = query.get("endDate")
-      ? new Date(query.get("endDate") as string)
+      ? parseBusinessDateTime(query.get("endDate") as string, "endDate")
       : null;
     return [...this.store.lessonChanges.values()]
       .filter((change) => {
-        const date = new Date(change.createdAt);
+        const date = parseBusinessDateTime(change.createdAt, "createdAt");
         return (
           this.canAccessClass(ctx, change.classId) &&
           (!childId || change.childId === childId) &&
@@ -1001,7 +1196,10 @@ export class AppService {
           (!end || date <= end)
         );
       })
-      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+      .sort(
+        (a, b) =>
+          businessTimestamp(b.createdAt) - businessTimestamp(a.createdAt),
+      );
   }
 
   requireLessonChange(ctx: AuthContext, changeId: string) {
@@ -1021,7 +1219,7 @@ export class AppService {
     const trainingClass = this.requireClass(ctx, lesson.classId);
     const makeup = nextLessonAfter(
       trainingClass,
-      new Date(lesson.scheduledDate),
+      parseBusinessDateTime(lesson.scheduledDate, "scheduledDate"),
       () => this.store.id(),
     );
     if (makeup) {
@@ -1078,14 +1276,14 @@ export class AppService {
   leaveHistory(ctx: AuthContext, query: URLSearchParams) {
     const childId = query.get("childId");
     const start = query.get("startDate")
-      ? new Date(query.get("startDate") as string)
+      ? parseBusinessDateTime(query.get("startDate") as string, "startDate")
       : null;
     const end = query.get("endDate")
-      ? new Date(query.get("endDate") as string)
+      ? parseBusinessDateTime(query.get("endDate") as string, "endDate")
       : null;
     return [...this.store.leaves.values()]
       .filter((leave) => {
-        const date = new Date(leave.requestTime);
+        const date = parseBusinessDateTime(leave.requestTime, "requestTime");
         return (
           this.canAccessClass(ctx, leave.classId) &&
           (!childId || leave.childId === childId) &&
@@ -1093,7 +1291,10 @@ export class AppService {
           (!end || date <= end)
         );
       })
-      .sort((a, b) => Date.parse(b.requestTime) - Date.parse(a.requestTime));
+      .sort(
+        (a, b) =>
+          businessTimestamp(b.requestTime) - businessTimestamp(a.requestTime),
+      );
   }
 
   makeupLessons(ctx: AuthContext) {
@@ -1237,8 +1438,8 @@ export class AppService {
       const { start, end } = assertDateRange(startParam, endParam);
       lessons = lessons.filter(
         (lesson) =>
-          new Date(lesson.scheduledDate) >= start &&
-          new Date(lesson.scheduledDate) <= end,
+          parseBusinessDateTime(lesson.scheduledDate) >= start &&
+          parseBusinessDateTime(lesson.scheduledDate) <= end,
       );
     }
     const rows = ["childName,className,courseName,scheduledDate,status,cost"];
@@ -1328,7 +1529,7 @@ export class AppService {
     classId: string | null,
   ) {
     return this.familyLessons(ctx).filter((lesson) => {
-      const date = new Date(lesson.scheduledDate);
+      const date = parseBusinessDateTime(lesson.scheduledDate);
       const trainingClass = this.store.classes.get(lesson.classId);
       return (
         date.getFullYear() === year &&
@@ -1360,7 +1561,7 @@ export class AppService {
     );
     const latestCompletedDate = preserved
       .filter((lesson) => lesson.status === "completed")
-      .map((lesson) => Date.parse(lesson.scheduledDate))
+      .map((lesson) => businessTimestamp(lesson.scheduledDate))
       .filter(Number.isFinite)
       .reduce((latest, date) => Math.max(latest, date), 0);
     const latestCompletedDayEnd =
@@ -1376,7 +1577,8 @@ export class AppService {
       () => this.store.id(),
     )
       .filter(
-        (lesson) => Date.parse(lesson.scheduledDate) > latestCompletedDayEnd,
+        (lesson) =>
+          businessTimestamp(lesson.scheduledDate) > latestCompletedDayEnd,
       )
       .filter(
         (lesson) =>
@@ -1430,18 +1632,130 @@ export class AppService {
   }
 
   private isSuspended(lesson: Lesson) {
-    const date = new Date(lesson.scheduledDate);
+    const date = parseBusinessDateTime(lesson.scheduledDate);
     return [...this.store.suspensions.values()].some(
       (item) =>
         item.classId === lesson.classId &&
-        date >= new Date(item.start) &&
-        date <= new Date(item.end),
+        date >= parseBusinessDateTime(item.start, "start") &&
+        date <= parseBusinessDateTime(item.end, "end"),
     );
   }
 
   private perSessionCost(trainingClass: TrainingClass | undefined) {
     if (!trainingClass || trainingClass.totalHours <= 0) return 0;
     return trainingClass.totalFee / trainingClass.totalHours;
+  }
+
+  private async fetchWeChatOpenid(code: string) {
+    if (!this.config.wechatAppId || !this.config.wechatAppSecret) {
+      throw badRequest("WECHAT_APP_ID and WECHAT_APP_SECRET are required", [
+        { field: "code", message: "服务端尚未配置微信小程序 appid/secret" },
+      ]);
+    }
+    const url = new URL("https://api.weixin.qq.com/sns/jscode2session");
+    url.searchParams.set("appid", this.config.wechatAppId);
+    url.searchParams.set("secret", this.config.wechatAppSecret);
+    url.searchParams.set("js_code", code);
+    url.searchParams.set("grant_type", "authorization_code");
+    let result: JsonResponse<WeChatErrorBody & { openid?: string }>;
+    try {
+      result = await requestJson<WeChatErrorBody & { openid?: string }>(url);
+    } catch (error) {
+      throw businessError("WECHAT_SESSION_REQUEST_FAILED", "微信登录凭证校验请求失败", [
+        {
+          field: "code",
+          message: error instanceof Error ? error.message : "无法连接微信接口",
+        },
+      ]);
+    }
+    const body = result.body;
+    if (result.status < 200 || result.status >= 300 || !body.openid) {
+      const detail = body.errcode
+        ? `${body.errmsg ?? "微信登录凭证校验失败"} (${body.errcode})`
+        : (body.errmsg ?? `微信接口返回 HTTP ${result.status}`);
+      throw businessError("WECHAT_SESSION_FAILED", "微信登录凭证校验失败", [
+        {
+          field: "code",
+          message: detail,
+        },
+      ]);
+    }
+    return body.openid;
+  }
+
+  private async sendLessonReminder(
+    openid: string,
+    subscription: LessonReminderSubscription,
+    lesson: Lesson,
+    trainingClass: TrainingClass,
+  ) {
+    const accessToken = await this.getWeChatAccessToken();
+    const child = this.store.children.get(trainingClass.childId);
+    const result = await requestJson<WeChatErrorBody>(
+      `https://api.weixin.qq.com/cgi-bin/message/subscribe/send?access_token=${encodeURIComponent(accessToken)}`,
+      {
+        method: "POST",
+        body: {
+          touser: openid,
+          template_id: subscription.templateId,
+          page: subscription.page ?? `/pages/class-detail/index?classId=${trainingClass.id}`,
+          data: {
+            thing1: { value: truncateTemplateValue(trainingClass.courseName || trainingClass.className, 20) },
+            time2: { value: formatTemplateDateTime(lesson.scheduledDate) },
+            thing3: { value: truncateTemplateValue(trainingClass.institutionName || "上课地点待确认", 20) },
+            thing4: { value: truncateTemplateValue(child?.name ?? "学员", 20) },
+            thing5: { value: truncateTemplateValue(`请提前${subscription.advanceMinutes}分钟准备`, 20) },
+          },
+        },
+      },
+    );
+    const body = result.body;
+    if (result.status < 200 || result.status >= 300 || body.errcode !== 0) {
+      throw new Error(body.errmsg ?? "微信订阅消息发送失败");
+    }
+  }
+
+  private async getWeChatAccessToken() {
+    if (!this.config.wechatAppId || !this.config.wechatAppSecret) {
+      throw new Error("WECHAT_APP_ID and WECHAT_APP_SECRET are required");
+    }
+    if (
+      cachedWechatAccessToken &&
+      cachedWechatAccessToken.expiresAt > Date.now() + 60_000
+    ) {
+      return cachedWechatAccessToken.token;
+    }
+    const url = new URL("https://api.weixin.qq.com/cgi-bin/token");
+    url.searchParams.set("grant_type", "client_credential");
+    url.searchParams.set("appid", this.config.wechatAppId);
+    url.searchParams.set("secret", this.config.wechatAppSecret);
+    const result = await requestJson<{
+      access_token?: string;
+      expires_in?: number;
+      errcode?: number;
+      errmsg?: string;
+    }>(url);
+    const body = result.body;
+    if (result.status < 200 || result.status >= 300 || !body.access_token) {
+      throw new Error(body.errmsg ?? "获取微信 access_token 失败");
+    }
+    cachedWechatAccessToken = {
+      token: body.access_token,
+      expiresAt: Date.now() + (body.expires_in ?? 7200) * 1000,
+    };
+    return body.access_token;
+  }
+
+  private failReminderSubscription(
+    subscription: LessonReminderSubscription,
+    failureReason: string,
+  ) {
+    this.store.reminderSubscriptions.set(subscription.id, {
+      ...subscription,
+      status: "failed",
+      failureReason,
+      updatedAt: nowIso(),
+    });
   }
 }
 
@@ -1480,7 +1794,85 @@ function defaultThemePreference(userId: string): ThemePreference {
 }
 
 function byScheduledDate(a: Lesson, b: Lesson) {
-  return Date.parse(a.scheduledDate) - Date.parse(b.scheduledDate);
+  return businessTimestamp(a.scheduledDate) - businessTimestamp(b.scheduledDate);
+}
+
+function truncateTemplateValue(value: string, maxLength: number) {
+  return value.length > maxLength ? value.slice(0, maxLength) : value;
+}
+
+function formatTemplateDateTime(value: string) {
+  const date = parseBusinessDateTime(value);
+  const month = `${date.getMonth() + 1}`.padStart(2, "0");
+  const day = `${date.getDate()}`.padStart(2, "0");
+  const hour = `${date.getHours()}`.padStart(2, "0");
+  const minute = `${date.getMinutes()}`.padStart(2, "0");
+  return `${date.getFullYear()}年${month}月${day}日 ${hour}:${minute}`;
+}
+
+function requestJson<T>(
+  input: URL | string,
+  options: JsonRequestOptions = {},
+): Promise<JsonResponse<T>> {
+  const url = typeof input === "string" ? new URL(input) : input;
+  const body =
+    options.body === undefined ? undefined : JSON.stringify(options.body);
+
+  return new Promise((resolve, reject) => {
+    const req = httpsRequest(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port || 443,
+        path: `${url.pathname}${url.search}`,
+        method: options.method ?? (body ? "POST" : "GET"),
+        timeout: 10_000,
+        rejectUnauthorized:
+          process.env.WECHAT_TLS_REJECT_UNAUTHORIZED === "true",
+        headers: {
+          accept: "application/json",
+          ...(body
+            ? {
+                "content-type": "application/json",
+                "content-length": Buffer.byteLength(body),
+              }
+            : {}),
+        },
+        lookup(hostname, opts, callback) {
+          dnsLookup(hostname, { ...opts, family: 4 }, callback);
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => {
+          const raw = Buffer.concat(chunks).toString("utf8");
+          try {
+            resolve({
+              status: res.statusCode ?? 0,
+              body: (raw ? JSON.parse(raw) : {}) as T,
+            });
+          } catch {
+            reject(
+              new Error(
+                `微信接口返回非 JSON 响应 HTTP ${res.statusCode ?? 0}`,
+              ),
+            );
+          }
+        });
+      },
+    );
+    req.on("timeout", () => req.destroy(new Error("微信接口请求超时")));
+    req.on("error", (error) => {
+      const detail =
+        "code" in error && typeof error.code === "string"
+          ? `${error.message} (${error.code})`
+          : error.message;
+      reject(new Error(detail));
+    });
+    if (body) req.write(body);
+    req.end();
+  });
 }
 
 function countsTowardClassHours(lesson: Lesson) {
@@ -1507,17 +1899,31 @@ function inferLessonEndDate(trainingClass: TrainingClass, scheduledDate: Date) {
 }
 
 function endOfDayTimestamp(timestamp: number) {
-  const date = new Date(timestamp);
-  date.setHours(23, 59, 59, 999);
-  return date.getTime();
+  return businessDayEnd(timestamp);
 }
 
 function overlaps(a: Lesson, b: Lesson) {
-  const aStart = Date.parse(a.scheduledDate);
-  const aEnd = Date.parse(a.scheduledEndDate ?? a.scheduledDate);
-  const bStart = Date.parse(b.scheduledDate);
-  const bEnd = Date.parse(b.scheduledEndDate ?? b.scheduledDate);
+  const aStart = businessTimestamp(a.scheduledDate);
+  const aEnd = businessTimestamp(a.scheduledEndDate ?? a.scheduledDate);
+  const bStart = businessTimestamp(b.scheduledDate);
+  const bEnd = businessTimestamp(b.scheduledEndDate ?? b.scheduledDate);
   return aStart < bEnd && bStart < aEnd;
+}
+
+function businessDayEnd(timestamp: number) {
+  const shifted = new Date(timestamp + 8 * 60 * 60 * 1000);
+  return (
+    Date.UTC(
+      shifted.getUTCFullYear(),
+      shifted.getUTCMonth(),
+      shifted.getUTCDate(),
+      23,
+      59,
+      59,
+      999,
+    ) -
+    8 * 60 * 60 * 1000
+  );
 }
 
 function assertClassStatus(value: unknown): TrainingClass["status"] {

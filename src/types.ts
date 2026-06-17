@@ -8,12 +8,14 @@ export type LessonChangeType = 'leave' | 'reschedule';
 export type LessonChangeSource = 'student' | 'teacher' | 'institution' | 'holiday' | 'other';
 export type LessonChangeStatus = 'active' | 'cancelled';
 export type ThemeSkin = 'warm' | 'fresh' | 'classic';
+export type ReminderSubscriptionStatus = 'pending' | 'sent' | 'failed' | 'cancelled';
 
 export interface User {
   id: string;
   phone: string;
   nickname?: string | null;
   avatarUrl?: string | null;
+  wechatOpenid?: string | null;
   createdAt: string;
 }
 
@@ -146,6 +148,23 @@ export interface ReminderSettings {
   advanceMinutes: number;
   includeTodayLessons: boolean;
   includeMakeupLessons: boolean;
+  updatedAt: string;
+}
+
+export interface LessonReminderSubscription {
+  id: string;
+  familyId: string;
+  userId: string;
+  lessonId: string;
+  templateId: string;
+  advanceMinutes: number;
+  scheduledAt: string;
+  remindAt: string;
+  page?: string | null;
+  status: ReminderSubscriptionStatus;
+  sentAt?: string | null;
+  failureReason?: string | null;
+  createdAt: string;
   updatedAt: string;
 }
 

@@ -50,16 +50,19 @@ DATABASE_URL=mysql://<username>:<password>@<internal-host>:<port>/<database>
 TOKEN_SECRET=<long-random-secret>
 ```
 
-The MySQL store uses the same `kv_store(collection, id, value)` shape as the SQLite store:
+The MySQL store uses normalized tables for core product data:
 
 ```sql
-CREATE TABLE IF NOT EXISTS kv_store (
-  collection VARCHAR(64) NOT NULL,
-  id VARCHAR(191) NOT NULL,
-  value JSON NOT NULL,
-  PRIMARY KEY (collection, id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+users
+families
+family_members
+children
+classes
+lessons
+auth_credentials
 ```
+
+Less central or fast-changing data, such as sessions, attendance side records, leaves, preferences, and reminder settings, still uses `kv_store(collection, id, value)`. On startup, legacy core records are migrated from `kv_store` into empty normalized tables. During request handling, MySQL core tables are refreshed before auth and business logic so direct database repairs are visible without relying on stale in-process snapshots.
 
 CloudBase MySQL direct connection should use the internal address from the cloud hosting service. Use external addresses only for local debugging.
 

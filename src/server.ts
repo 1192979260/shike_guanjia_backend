@@ -13,6 +13,14 @@ server.listen(config.port, () => {
   console.info(`shike-guanjia-backend listening on http://localhost:${config.port}`);
 });
 
+if (config.reminderScanIntervalMs > 0) {
+  setInterval(() => {
+    service.processDueLessonReminders().catch((error) => {
+      console.error("processDueLessonReminders failed", error);
+    });
+  }, config.reminderScanIntervalMs).unref();
+}
+
 async function createStore(config: Config) {
   if (config.storageMode === 'mysql') {
     if (!config.databaseUrl) throw new Error('DATABASE_URL is required when STORAGE_MODE=mysql');

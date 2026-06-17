@@ -55,6 +55,7 @@ export function createApp(service: AppService) {
       if (!routeMatch) throw notFound("Endpoint not found");
       const body = await parseBody(req);
       const tokenHeader = req.headers.authorization;
+      await service.store.refresh();
       const auth = routeMatch.route.auth
         ? service.authenticate(tokenHeader)
         : undefined;
@@ -140,6 +141,9 @@ function buildRoutes(service: AppService): Route[] {
     route("POST", "/api/auth/logout", true, (ctx) =>
       service.logout(ctx.tokenHeader),
     ),
+    route("POST", "/api/auth/wechat-session", true, (ctx) =>
+      service.bindWeChatSession(a(ctx), ctx.body),
+    ),
     route("GET", "/api/family", true, (ctx) => service.getFamily(a(ctx))),
     route("GET", "/api/family/members", true, (ctx) =>
       service.getFamilyMembers(a(ctx)),
@@ -155,6 +159,9 @@ function buildRoutes(service: AppService): Route[] {
     ),
     route("PATCH", "/api/reminder-settings", true, (ctx) =>
       service.updateReminderSettings(a(ctx), ctx.body),
+    ),
+    route("POST", "/api/reminder-subscriptions", true, (ctx) =>
+      service.registerLessonReminders(a(ctx), ctx.body),
     ),
     route("GET", "/api/preferences/theme", true, (ctx) =>
       service.getThemePreference(a(ctx)),
