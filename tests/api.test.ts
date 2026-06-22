@@ -27,10 +27,10 @@ const rule: RecurringRule = {
   ],
 };
 
-beforeEach(() => {
+beforeEach(async () => {
   store = new MemoryStore();
   service = new AppService(store, loadConfig({ NODE_ENV: "test" }));
-  const login = service.register("13800138000", "password123");
+  const login = await service.register("13800138000", "password123");
   token = login.token;
   auth = service.authenticate(`Bearer ${token}`);
 });
@@ -94,16 +94,16 @@ describe("auth and family", { concurrency: false }, () => {
     assert.equal(me.family.members[0]?.relation, "mother");
   });
 
-  it("logs in with password and rejects duplicate registration or wrong password", () => {
-    const login = service.login("13800138000", "password123");
+  it("logs in with password and rejects duplicate registration or wrong password", async () => {
+    const login = await service.login("13800138000", "password123");
     assert.equal(
       service.authenticate(`Bearer ${login.token}`).user.phone,
       "13800138000",
     );
-    assert.throws(() => service.login("13800138000", "wrongpass"), {
+    await assert.rejects(() => service.login("13800138000", "wrongpass"), {
       code: "UNAUTHORIZED",
     });
-    assert.throws(() => service.register("13800138000", "password123"), {
+    await assert.rejects(() => service.register("13800138000", "password123"), {
       code: "BAD_REQUEST",
     });
   });
@@ -126,7 +126,7 @@ describe("auth and family", { concurrency: false }, () => {
     );
   });
 
-  it("uses stable family sharing error codes and invalidates removed member sessions", () => {
+  it("uses stable family sharing error codes and invalidates removed member sessions", async () => {
     service.addFamilyMember(auth, { phone: "13900139000", relation: "father" });
     assert.throws(
       () =>
@@ -145,7 +145,7 @@ describe("auth and family", { concurrency: false }, () => {
       { code: "FAMILY_MEMBER_LIMIT_REACHED" },
     );
 
-    const memberLogin = service.register("13900139000", "password123");
+    const memberLogin = await service.register("13900139000", "password123");
     const memberAuth = service.authenticate(`Bearer ${memberLogin.token}`);
     assert.equal(memberAuth.familyId, auth.familyId);
 
@@ -159,7 +159,7 @@ describe("auth and family", { concurrency: false }, () => {
     });
   });
 
-  it("persists users, sessions, and children across file-store restart", () => {
+  it("persists users, sessions, and children across file-store restart", async () => {
     const filePath = ".data/test-persistence.json";
     rmSync(filePath, { force: true });
 
@@ -168,7 +168,7 @@ describe("auth and family", { concurrency: false }, () => {
       firstStore,
       loadConfig({ NODE_ENV: "test" }),
     );
-    const login = firstService.register("13600136000", "password123");
+    const login = await firstService.register("13600136000", "password123");
     const firstAuth = firstService.authenticate(`Bearer ${login.token}`);
     const child = firstService.createChild(firstAuth, { name: "真实宝贝" });
 
@@ -184,7 +184,7 @@ describe("auth and family", { concurrency: false }, () => {
     rmSync(filePath, { force: true });
   });
 
-  it("persists reminder settings and theme preferences across file-store restart", () => {
+  it("persists reminder settings and theme preferences across file-store restart", async () => {
     const filePath = ".data/test-preferences.json";
     rmSync(filePath, { force: true });
 
@@ -193,7 +193,7 @@ describe("auth and family", { concurrency: false }, () => {
       firstStore,
       loadConfig({ NODE_ENV: "test" }),
     );
-    const login = firstService.register("13600136000", "password123");
+    const login = await firstService.register("13600136000", "password123");
     const firstAuth = firstService.authenticate(`Bearer ${login.token}`);
 
     firstService.updateReminderSettings(firstAuth, {
@@ -218,7 +218,7 @@ describe("auth and family", { concurrency: false }, () => {
     rmSync(filePath, { force: true });
   });
 
-  it("persists family member changes across file-store restart", () => {
+  it("persists family member changes across file-store restart", async () => {
     const filePath = ".data/test-family-members.json";
     rmSync(filePath, { force: true });
 
@@ -227,7 +227,7 @@ describe("auth and family", { concurrency: false }, () => {
       firstStore,
       loadConfig({ NODE_ENV: "test" }),
     );
-    const login = firstService.register("13600136000", "password123");
+    const login = await firstService.register("13600136000", "password123");
     const firstAuth = firstService.authenticate(`Bearer ${login.token}`);
 
     const member = firstService.addFamilyMember(firstAuth, {
@@ -266,7 +266,7 @@ describe("auth and family", { concurrency: false }, () => {
     rmSync(filePath, { force: true });
   });
 
-  it("returns default and partial-updated family reminder settings across member sessions", () => {
+  it("returns default and partial-updated family reminder settings across member sessions", async () => {
     const defaults = service.getReminderSettings(auth);
     assert.equal(defaults.familyId, auth.familyId);
     assert.equal(defaults.enabled, true);
@@ -283,7 +283,7 @@ describe("auth and family", { concurrency: false }, () => {
     assert.equal(updated.includeTodayLessons, true);
 
     service.addFamilyMember(auth, { phone: "13900139000", relation: "father" });
-    const memberLogin = service.register("13900139000", "password123");
+    const memberLogin = await service.register("13900139000", "password123");
     const memberAuth = service.authenticate(`Bearer ${memberLogin.token}`);
     assert.deepEqual(service.getReminderSettings(memberAuth), updated);
   });
@@ -441,7 +441,7 @@ describe("auth and family", { concurrency: false }, () => {
     assert.equal(templateData.time15.value, "2026年06月18日 13:40");
   });
 
-  it("returns default and updated user theme preference without sharing it across family members", () => {
+  it("returns default and updated user theme preference without sharing it across family members", async () => {
     const defaults = service.getThemePreference(auth);
     assert.equal(defaults.userId, auth.user.id);
     assert.equal(defaults.skin, "warm");
@@ -449,7 +449,7 @@ describe("auth and family", { concurrency: false }, () => {
     const updated = service.updateThemePreference(auth, { skin: "fresh" });
     assert.equal(updated.skin, "fresh");
     service.logout(`Bearer ${token}`);
-    const relogin = service.login("13800138000", "password123");
+    const relogin = await service.login("13800138000", "password123");
     const reloginAuth = service.authenticate(`Bearer ${relogin.token}`);
     assert.equal(service.getThemePreference(reloginAuth).skin, "fresh");
 
@@ -457,7 +457,7 @@ describe("auth and family", { concurrency: false }, () => {
       phone: "13900139000",
       relation: "father",
     });
-    const memberLogin = service.register("13900139000", "password123");
+    const memberLogin = await service.register("13900139000", "password123");
     const memberAuth = service.authenticate(`Bearer ${memberLogin.token}`);
     assert.equal(service.getThemePreference(memberAuth).skin, "warm");
   });

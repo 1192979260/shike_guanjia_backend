@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { createPool, type Pool, type RowDataPacket } from "mysql2/promise";
+import { createPool, type Pool, type PoolConnection, type RowDataPacket } from "mysql2/promise";
 import type { BackendRepositories } from "./repositories.js";
 import { normalizeDateString } from "./date-time.js";
 import type {
@@ -25,6 +25,11 @@ export interface Session {
   createdAt: string;
 }
 
+/** How long the in-memory cache is considered fresh before a reload is forced.
+ *  Bounds cross-instance staleness; within an instance the cache is always
+ *  current because mutations are applied synchronously. */
+const REFRESH_MAX_AGE_MS = 5_000;
+
 export interface AuthCredential {
   phone: string;
   passwordHash: string;
@@ -33,6 +38,7 @@ export interface AuthCredential {
 }
 
 export class MemoryStore implements BackendRepositories {
+  storageMode: string = "memory";
   users = new Map<string, User>();
   families = new Map<string, Family>();
   children = new Map<string, Child>();
@@ -72,6 +78,18 @@ export class MemoryStore implements BackendRepositories {
   async refresh() {}
 
   async waitForIdle() {}
+
+  /** No-op transaction wrapper for in-memory stores. Real stores flush buffered
+   *  writes in a single DB transaction. */
+  async runInTransaction<T>(fn: () => T | Promise<T>): Promise<T> {
+    return fn();
+  }
+
+  async healthCheck(_deep = false): Promise<{ ok: boolean; storage: string }> {
+    return { ok: true, storage: this.storageMode };
+  }
+
+  async close(): Promise<void> {}
 }
 
 interface StoreSnapshot {
@@ -92,6 +110,7 @@ interface StoreSnapshot {
 }
 
 export class FileStore extends MemoryStore {
+  storageMode = "file";
   private loading = false;
 
   constructor(private filePath: string) {
@@ -232,22 +251,39 @@ interface KvRow extends RowDataPacket {
 }
 
 export class MysqlStore extends MemoryStore {
+  storageMode = "mysql";
   private pendingWrite: Promise<void> = Promise.resolve();
   private refreshing = false;
+  private lastRefreshAt = 0;
+  private txBuffer: Array<(conn: PoolConnection) => Promise<void>> | null = null;
 
   private constructor(private pool: Pool) {
     super();
   }
 
   static async create(databaseUrl: string) {
-    const store = new MysqlStore(
-      createPool({
-        uri: databaseUrl,
-        waitForConnections: true,
-        connectionLimit: 5,
-        namedPlaceholders: false,
-      }),
-    );
+    const connectionLimit = Number(process.env.MYSQL_CONNECTION_LIMIT ?? 15);
+    const pool = createPool({
+      uri: databaseUrl,
+      waitForConnections: true,
+      connectionLimit: Number.isFinite(connectionLimit) && connectionLimit > 0 ? connectionLimit : 15,
+      namedPlaceholders: false,
+      connectTimeout: 10_000,
+    });
+    // mysql2's typed events are narrow; attach an error listener so a pool-level
+    // connection error is logged instead of crashing the process.
+    (pool as unknown as {
+      on(event: "error", listener: (err: Error) => void): unknown;
+    }).on("error", (error) => {
+      console.error(
+        JSON.stringify({
+          level: "error",
+          message: "mysql pool error",
+          error: error.message,
+        }),
+      );
+    });
+    const store = new MysqlStore(pool);
     await store.initialize();
     return store;
   }
@@ -275,10 +311,16 @@ export class MysqlStore extends MemoryStore {
 
   override async refresh() {
     if (this.refreshing) return;
+    // Skip the 14-table reload when the cache is still fresh. Within a single
+    // instance the in-memory Maps are kept current by synchronous mutations, so
+    // a reload is only needed to pick up writes from OTHER instances — a TTL
+    // of a few seconds bounds cross-instance staleness cheaply.
+    if (Date.now() - this.lastRefreshAt < REFRESH_MAX_AGE_MS) return;
     this.refreshing = true;
     try {
       await this.waitForIdle();
       await this.refreshTables();
+      this.lastRefreshAt = Date.now();
     } finally {
       this.refreshing = false;
     }
@@ -293,10 +335,56 @@ export class MysqlStore extends MemoryStore {
     await this.pool.end();
   }
 
+  /** Runs `fn` with writes buffered, then flushes them in a single DB
+   *  transaction so multi-step operations (check-in + lesson update + class
+   *  usage refresh, etc.) commit atomically. Nested calls join the outer txn. */
+  override async runInTransaction<T>(fn: () => T | Promise<T>): Promise<T> {
+    if (this.txBuffer) return fn();
+    this.txBuffer = [];
+    try {
+      const result = await fn();
+      const buffer = this.txBuffer;
+      this.txBuffer = null;
+      if (buffer.length === 0) return result;
+      await this.enqueueWrite(async () => {
+        const conn = await this.pool.getConnection();
+        try {
+          await conn.beginTransaction();
+          for (const task of buffer) await task(conn);
+          await conn.commit();
+        } catch (error) {
+          await conn.rollback().catch(() => {});
+          throw error;
+        } finally {
+          conn.release();
+        }
+      });
+      return result;
+    } catch (error) {
+      this.txBuffer = null;
+      throw error;
+    }
+  }
+
+  override async healthCheck(deep = false): Promise<{ ok: boolean; storage: string; db?: string }> {
+    if (!deep) return { ok: true, storage: this.storageMode };
+    try {
+      await this.pool.query("SELECT 1");
+      return { ok: true, storage: this.storageMode, db: "up" };
+    } catch (error) {
+      return {
+        ok: false,
+        storage: this.storageMode,
+        db: "down",
+      };
+    }
+  }
+
   private async initialize() {
     await this.createCoreTables();
     await this.createAuxiliaryTables();
-    await this.dropCoreForeignKeys();
+    await this.ensureSchemaMigrationsTable();
+    await this.ensureForeignKeys();
     await this.migrateLegacyKvStore();
     await this.refreshTables();
   }
@@ -522,22 +610,70 @@ export class MysqlStore extends MemoryStore {
     `);
   }
 
-  private async dropCoreForeignKeys() {
-    await this.dropForeignKeyIfExists("family_members", "fk_family_members_family");
-    await this.dropForeignKeyIfExists("family_members", "fk_family_members_user");
-    await this.dropForeignKeyIfExists("children", "fk_children_family");
-    await this.dropForeignKeyIfExists("classes", "fk_classes_family");
-    await this.dropForeignKeyIfExists("classes", "fk_classes_child");
-    await this.dropForeignKeyIfExists("lessons", "fk_lessons_class");
+  /** Restores referential integrity with ON DELETE CASCADE foreign keys.
+   *  Best-effort: if legacy orphaned rows prevent a constraint from being added,
+   *  the error is logged (non-fatal) so deployment isn't blocked — clean/new
+   *  databases get the constraints, dirty ones should be cleaned manually. */
+  private async ensureForeignKeys() {
+    const constraints: Array<{
+      table: string;
+      name: string;
+      column: string;
+      refTable: string;
+      refColumn: string;
+    }> = [
+      { table: "family_members", name: "fk_family_members_family", column: "family_id", refTable: "families", refColumn: "id" },
+      { table: "family_members", name: "fk_family_members_user", column: "user_id", refTable: "users", refColumn: "id" },
+      { table: "children", name: "fk_children_family", column: "family_id", refTable: "families", refColumn: "id" },
+      { table: "classes", name: "fk_classes_family", column: "family_id", refTable: "families", refColumn: "id" },
+      { table: "classes", name: "fk_classes_child", column: "child_id", refTable: "children", refColumn: "id" },
+      { table: "lessons", name: "fk_lessons_class", column: "class_id", refTable: "classes", refColumn: "id" },
+      { table: "attendance", name: "fk_attendance_lesson", column: "lesson_id", refTable: "lessons", refColumn: "id" },
+      { table: "attendance", name: "fk_attendance_class", column: "class_id", refTable: "classes", refColumn: "id" },
+      { table: "leaves", name: "fk_leaves_lesson", column: "lesson_id", refTable: "lessons", refColumn: "id" },
+      { table: "lesson_changes", name: "fk_lesson_changes_lesson", column: "lesson_id", refTable: "lessons", refColumn: "id" },
+      { table: "suspensions", name: "fk_suspensions_class", column: "class_id", refTable: "classes", refColumn: "id" },
+      { table: "sessions", name: "fk_sessions_user", column: "user_id", refTable: "users", refColumn: "id" },
+      { table: "reminder_settings", name: "fk_reminder_settings_family", column: "family_id", refTable: "families", refColumn: "id" },
+      { table: "reminder_subscriptions", name: "fk_reminder_subs_family", column: "family_id", refTable: "families", refColumn: "id" },
+      { table: "reminder_subscriptions", name: "fk_reminder_subs_lesson", column: "lesson_id", refTable: "lessons", refColumn: "id" },
+      { table: "theme_preferences", name: "fk_theme_prefs_user", column: "user_id", refTable: "users", refColumn: "id" },
+    ];
+    for (const c of constraints) {
+      try {
+        await this.pool.execute(
+          `ALTER TABLE ${c.table} ADD CONSTRAINT ${c.name} FOREIGN KEY (${c.column}) REFERENCES ${c.refTable} (${c.refColumn}) ON DELETE CASCADE`,
+        );
+      } catch (error) {
+        const code = (error as { code?: string }).code;
+        // Already exists is fine; anything else is logged but non-fatal.
+        if (code !== "ER_FK_DUP_NAME" && code !== "ER_DUP_KEYNAME") {
+          console.warn(
+            JSON.stringify({
+              level: "warn",
+              message: `could not add foreign key ${c.name}`,
+              code,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          );
+        }
+      }
+    }
   }
 
-  private async dropForeignKeyIfExists(table: string, constraint: string) {
-    try {
-      await this.pool.execute(`ALTER TABLE ${table} DROP FOREIGN KEY ${constraint}`);
-    } catch (error) {
-      const code = (error as { code?: string }).code;
-      if (code !== "ER_CANT_DROP_FIELD_OR_KEY") throw error;
-    }
+  private async ensureSchemaMigrationsTable() {
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version VARCHAR(64) NOT NULL PRIMARY KEY,
+        applied_at VARCHAR(64) NOT NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    // Stamp the baseline schema (the idempotent CREATE TABLE DDL above) as
+    // migration 0001 so future schema changes have a versioned home.
+    await this.pool.execute(
+      `INSERT IGNORE INTO schema_migrations (version, applied_at) VALUES ('0001_initial', ?)`,
+      [new Date().toISOString()],
+    );
   }
 
   private async addColumnIfMissing(table: string, column: string, definition: string) {
@@ -1050,31 +1186,39 @@ export class MysqlStore extends MemoryStore {
   private persistedMap<T>(collection: string, source: Map<string, T>) {
     return new PersistedMap<string, T>(
       [...source.entries()],
-      () => this.persistCollection(collection, source),
+      // `clear()` is only invoked by reset(), which already issues explicit
+      // per-table DELETEs — so a no-op here avoids the old full-table-wipe +
+      // re-insert footgun. Row-level set/delete are handled below.
+      () => {},
       (key, value) => this.setRecord(collection, key, value),
       (key) => this.deleteRecord(collection, key),
     );
   }
 
-  private persistCollection<T>(collection: string, source: Map<string, T>) {
-    this.enqueueWrite(async () => {
-      await this.deleteCollectionNow(collection);
-      for (const [key, value] of source.entries())
-        await this.setRecordNow(collection, key, value);
-    });
-  }
-
   private setRecord<T>(collection: string, key: string, value: T) {
+    if (this.txBuffer) {
+      this.txBuffer.push((conn) => this.setRecordNow(collection, key, value, conn));
+      return;
+    }
     this.enqueueWrite(() => this.setRecordNow(collection, key, value));
   }
 
-  private async setRecordNow<T>(collection: string, key: string, value: T) {
+  private async setRecordNow<T>(
+    collection: string,
+    key: string,
+    value: T,
+    conn?: PoolConnection,
+  ) {
     if (this.isCoreCollection(collection))
-      return this.setCoreRecordNow(collection, key, value);
-    return this.setAuxiliaryRecordNow(collection, key, value);
+      return this.setCoreRecordNow(collection, key, value, conn);
+    return this.setAuxiliaryRecordNow(collection, key, value, conn);
   }
 
   private deleteRecord(collection: string, key: string) {
+    if (this.txBuffer) {
+      this.txBuffer.push((conn) => this.deleteRecordNow(collection, key, conn));
+      return;
+    }
     this.enqueueWrite(() => this.deleteRecordNow(collection, key));
   }
 
@@ -1089,23 +1233,19 @@ export class MysqlStore extends MemoryStore {
     );
   }
 
-  private async deleteCollectionNow(collection: string) {
-    const table = this.collectionTableName(collection);
-    if (collection === "families")
-      await this.pool.execute("DELETE FROM family_members");
-    await this.pool.execute(`DELETE FROM ${table}`);
-  }
-
-  private async deleteRecordNow(collection: string, key: string) {
+  private async deleteRecordNow(
+    collection: string,
+    key: string,
+    conn?: PoolConnection,
+  ) {
+    const db = conn ?? this.pool;
     if (collection === "authCredentials") {
-      await this.pool.execute("DELETE FROM auth_credentials WHERE phone = ?", [
-        key,
-      ]);
+      await db.execute("DELETE FROM auth_credentials WHERE phone = ?", [key]);
       return;
     }
     const table = this.collectionTableName(collection);
     const keyColumn = this.collectionKeyColumn(collection);
-    await this.pool.execute(`DELETE FROM ${table} WHERE ${keyColumn} = ?`, [key]);
+    await db.execute(`DELETE FROM ${table} WHERE ${keyColumn} = ?`, [key]);
   }
 
   private collectionTableName(collection: string) {
@@ -1160,12 +1300,14 @@ export class MysqlStore extends MemoryStore {
 
   private async setCoreRecordNow<T>(
     collection: string,
-    key: string,
+    _key: string,
     value: T,
+    conn?: PoolConnection,
   ) {
+    const db = conn ?? this.pool;
     if (collection === "users") {
       const item = value as User;
-      await this.pool.execute(
+      await db.execute(
         `INSERT INTO users (id, phone, nickname, avatar_url, wechat_openid, created_at)
          VALUES (?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
@@ -1187,17 +1329,17 @@ export class MysqlStore extends MemoryStore {
     }
     if (collection === "families") {
       const item = value as Family;
-      await this.pool.execute(
+      await db.execute(
         `INSERT INTO families (id, name)
          VALUES (?, ?)
          ON DUPLICATE KEY UPDATE name = VALUES(name)`,
         [item.id, item.name],
       );
-      await this.pool.execute("DELETE FROM family_members WHERE family_id = ?", [
+      await db.execute("DELETE FROM family_members WHERE family_id = ?", [
         item.id,
       ]);
       for (const member of item.members) {
-        await this.pool.execute(
+        await db.execute(
           `INSERT INTO family_members
              (id, family_id, user_id, relation, display_name, created_at)
            VALUES (?, ?, ?, ?, ?, ?)
@@ -1220,7 +1362,7 @@ export class MysqlStore extends MemoryStore {
     }
     if (collection === "children") {
       const item = value as Child;
-      await this.pool.execute(
+      await db.execute(
         `INSERT INTO children (id, family_id, name, age, avatar_url, created_at)
          VALUES (?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
@@ -1242,7 +1384,7 @@ export class MysqlStore extends MemoryStore {
     }
     if (collection === "classes") {
       const item = value as TrainingClass;
-      await this.pool.execute(
+      await db.execute(
         `INSERT INTO classes
           (id, child_id, family_id, institution_name, class_name, course_name,
            teacher_name, teacher_phone, total_hours, historical_used_hours, used_hours,
@@ -1296,7 +1438,7 @@ export class MysqlStore extends MemoryStore {
     }
     if (collection === "lessons") {
       const item = value as Lesson;
-      await this.pool.execute(
+      await db.execute(
         `INSERT INTO lessons
           (id, class_id, scheduled_date, scheduled_end_date, status,
            source_type, attendance_status, change_status, actual_date, checkin_time,
@@ -1341,7 +1483,7 @@ export class MysqlStore extends MemoryStore {
     }
     if (collection === "authCredentials") {
       const item = value as AuthCredential;
-      await this.pool.execute(
+      await db.execute(
         `INSERT INTO auth_credentials (phone, password_hash, salt, created_at)
          VALUES (?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
@@ -1355,12 +1497,14 @@ export class MysqlStore extends MemoryStore {
 
   private async setAuxiliaryRecordNow<T>(
     collection: string,
-    key: string,
+    _key: string,
     value: T,
+    conn?: PoolConnection,
   ) {
+    const db = conn ?? this.pool;
     if (collection === "sessions") {
       const item = value as Session;
-      await this.pool.execute(
+      await db.execute(
         `INSERT INTO sessions (token, user_id, created_at)
          VALUES (?, ?, ?)
          ON DUPLICATE KEY UPDATE
@@ -1372,7 +1516,7 @@ export class MysqlStore extends MemoryStore {
     }
     if (collection === "attendance") {
       const item = value as Attendance;
-      await this.pool.execute(
+      await db.execute(
         `INSERT INTO attendance
           (id, lesson_id, class_id, child_id, checkin_time, type,
            actual_start_time, actual_end_time, notes, created_at)
@@ -1404,7 +1548,7 @@ export class MysqlStore extends MemoryStore {
     }
     if (collection === "leaves") {
       const item = value as LeaveRecord;
-      await this.pool.execute(
+      await db.execute(
         `INSERT INTO leaves
           (id, lesson_id, class_id, child_id, request_time, status,
            reason, makeup_lesson_id, created_at)
@@ -1434,7 +1578,7 @@ export class MysqlStore extends MemoryStore {
     }
     if (collection === "lesson_changes") {
       const item = value as LessonChangeRecord;
-      await this.pool.execute(
+      await db.execute(
         `INSERT INTO lesson_changes
           (id, lesson_id, class_id, child_id, type, source, reason, description,
            original_start_at, original_end_at, new_scheduled_date,
@@ -1482,7 +1626,7 @@ export class MysqlStore extends MemoryStore {
     }
     if (collection === "suspensions") {
       const item = value as SuspensionPeriod;
-      await this.pool.execute(
+      await db.execute(
         `INSERT INTO suspensions (id, class_id, start_time, end_time)
          VALUES (?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
@@ -1495,7 +1639,7 @@ export class MysqlStore extends MemoryStore {
     }
     if (collection === "reminderSettings") {
       const item = value as ReminderSettings;
-      await this.pool.execute(
+      await db.execute(
         `INSERT INTO reminder_settings
           (family_id, enabled, advance_minutes, include_today_lessons,
            include_makeup_lessons, updated_at)
@@ -1519,7 +1663,7 @@ export class MysqlStore extends MemoryStore {
     }
     if (collection === "reminderSubscriptions") {
       const item = value as LessonReminderSubscription;
-      await this.pool.execute(
+      await db.execute(
         `INSERT INTO reminder_subscriptions
           (id, family_id, user_id, lesson_id, template_id, advance_minutes,
            scheduled_at, remind_at, page, status, sent_at, failure_reason,
@@ -1560,7 +1704,7 @@ export class MysqlStore extends MemoryStore {
     }
     if (collection === "themePreferences") {
       const item = value as ThemePreference;
-      await this.pool.execute(
+      await db.execute(
         `INSERT INTO theme_preferences (user_id, skin, updated_at)
          VALUES (?, ?, ?)
          ON DUPLICATE KEY UPDATE

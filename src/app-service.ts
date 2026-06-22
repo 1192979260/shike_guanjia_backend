@@ -1,11 +1,9 @@
 import {
   createHmac,
   randomBytes,
-  scryptSync,
+  scrypt,
   timingSafeEqual,
 } from "node:crypto";
-import { lookup as dnsLookup } from "node:dns";
-import { request as httpsRequest } from "node:https";
 import type { Config } from "./config.js";
 import {
   businessAddDays,
@@ -24,10 +22,13 @@ import {
   businessError,
   forbidden,
   notFound,
+  rateLimited,
   unauthorized,
 } from "./errors.js";
 import { generateLessonsForClass } from "./schedule.js";
 import { MemoryStore } from "./store.js";
+import { WeChatClient } from "./wechat-client.js";
+export { buildLessonReminderTemplateData } from "./wechat-client.js";
 import type {
   Attendance,
   ClassCostBreakdown,
@@ -66,56 +67,26 @@ const CHECKIN_LATE_WINDOW_MS = 2 * 60 * 60 * 1000;
 const BACKDATED_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const UPCOMING_DEFAULT_DAYS = 3;
 
-let cachedWechatAccessToken:
-  | { token: string; expiresAt: number }
-  | undefined;
-
-interface WeChatErrorBody {
-  errcode?: number;
-  errmsg?: string;
-}
-
-interface JsonResponse<T> {
-  status: number;
-  body: T;
-}
-
-interface JsonRequestOptions {
-  method?: "GET" | "POST";
-  body?: unknown;
-}
-
 export interface AuthContext {
   user: User;
   familyId: string;
 }
 
-export function buildLessonReminderTemplateData(
-  subscription: LessonReminderSubscription,
-  lesson: Lesson,
-  trainingClass: TrainingClass,
-  childName?: string | null,
-) {
-  const courseName = truncateTemplateValue(
-    trainingClass.courseName || trainingClass.className || "课程提醒",
-    20,
-  );
-  const studentName = truncateTemplateValue(childName || "学员", 20);
-
-  return {
-    thing9: { value: studentName },
-    thing8: { value: courseName },
-    time15: { value: formatTemplateDateTime(lesson.scheduledDate) },
-  };
-}
-
 export class AppService {
+  private loginAttempts = new Map<
+    string,
+    { count: number; firstAt: number; lockedUntil?: number }
+  >();
+  private wechat: WeChatClient;
+
   constructor(
     public store: MemoryStore,
     private config: Config,
-  ) {}
+  ) {
+    this.wechat = new WeChatClient(config);
+  }
 
-  register(phoneValue: unknown, passwordValue: unknown) {
+  async register(phoneValue: unknown, passwordValue: unknown) {
     const phone = assertPhone(phoneValue);
     const password = assertPassword(passwordValue);
     if (this.store.authCredentials.has(phone))
@@ -123,18 +94,21 @@ export class AppService {
         { field: "phone", message: "该手机号已注册" },
       ]);
     const { user, family } = this.ensureUserAndFamily(phone);
-    this.store.authCredentials.set(phone, hashPassword(phone, password));
+    this.store.authCredentials.set(phone, await hashPassword(phone, password));
     const token = this.issueToken(user.id);
     return { token, user, family };
   }
 
-  login(phoneValue: unknown, passwordValue: unknown) {
+  async login(phoneValue: unknown, passwordValue: unknown) {
     const phone = assertPhone(phoneValue);
     const password = assertPassword(passwordValue);
+    this.assertLoginAllowed(phone);
     const credential = this.store.authCredentials.get(phone);
-    if (!credential || !verifyPassword(password, credential)) {
+    if (!credential || !(await verifyPassword(password, credential))) {
+      this.recordLoginFailure(phone);
       throw unauthorized("Invalid phone or password");
     }
+    this.clearLoginAttempts(phone);
     const user = [...this.store.users.values()].find(
       (item) => item.phone === phone,
     );
@@ -142,6 +116,35 @@ export class AppService {
     const family = this.ensureFamily(user);
     const token = this.issueToken(user.id);
     return { token, user, family };
+  }
+
+  private assertLoginAllowed(phone: string) {
+    const entry = this.loginAttempts.get(phone);
+    if (!entry) return;
+    const now = Date.now();
+    if (entry.lockedUntil && entry.lockedUntil > now) {
+      throw rateLimited("登录尝试过多，请稍后再试");
+    }
+    if (now - entry.firstAt > this.config.loginAttemptWindowMs) {
+      this.loginAttempts.delete(phone);
+    }
+  }
+
+  private recordLoginFailure(phone: string) {
+    const now = Date.now();
+    let entry = this.loginAttempts.get(phone);
+    if (!entry || now - entry.firstAt > this.config.loginAttemptWindowMs) {
+      entry = { count: 0, firstAt: now };
+    }
+    entry.count += 1;
+    if (entry.count >= this.config.loginMaxAttempts) {
+      entry.lockedUntil = now + this.config.loginLockoutMs;
+    }
+    this.loginAttempts.set(phone, entry);
+  }
+
+  private clearLoginAttempts(phone: string) {
+    this.loginAttempts.delete(phone);
   }
 
   private ensureUserAndFamily(phone: string) {
@@ -191,6 +194,18 @@ export class AppService {
     if (!token) throw unauthorized();
     const session = this.store.sessions.get(token);
     if (!session) throw unauthorized();
+    // Defense in depth: verify the HMAC signature embedded in the token so a
+    // compromised session store alone cannot mint arbitrary tokens.
+    if (!verifyTokenSignature(token, this.config.tokenSecret)) {
+      this.store.sessions.delete(token);
+      throw unauthorized();
+    }
+    // Enforce session TTL — stolen tokens expire instead of lasting forever.
+    const ageMs = Date.now() - businessTimestamp(session.createdAt);
+    if (ageMs > this.config.maxSessionAgeMs) {
+      this.store.sessions.delete(token);
+      throw unauthorized("Session expired");
+    }
     const user = this.store.users.get(session.userId);
     if (!user) throw unauthorized();
     const family = [...this.store.families.values()].find((item) =>
@@ -198,6 +213,15 @@ export class AppService {
     );
     if (!family) throw unauthorized("Family not found");
     return { user, familyId: family.id };
+  }
+
+  /** Shallow + optional deep health probe for the load balancer / ops. */
+  async healthCheck(deep = false): Promise<{
+    ok: boolean;
+    storage: string;
+    db?: string;
+  }> {
+    return this.store.healthCheck(deep);
   }
 
   me(ctx: AuthContext) {
@@ -314,7 +338,7 @@ export class AppService {
     }
     const openid =
       openidFromBody ??
-      (await this.fetchWeChatOpenid(assertString(body.code, "code", "登录凭证", 512)));
+      (await this.wechat.fetchOpenid(assertString(body.code, "code", "登录凭证", 512)));
     const updated: User = {
       ...ctx.user,
       wechatOpenid: openid,
@@ -409,12 +433,17 @@ export class AppService {
   }
 
   async processDueLessonReminders(now = new Date()) {
+    const staleBefore = now.getTime() - 10 * 60 * 1000;
+    // Pick pending subscriptions that are due, plus "processing" ones stuck for
+    // >10 min (in case a previous run crashed mid-send) so they get retried.
     const due = [...this.store.reminderSubscriptions.values()]
-      .filter(
-        (item) =>
-          item.status === "pending" &&
-          businessTimestamp(item.remindAt) <= now.getTime(),
-      )
+      .filter((item) => {
+        if (item.status === "pending")
+          return businessTimestamp(item.remindAt) <= now.getTime();
+        if (item.status === "processing")
+          return businessTimestamp(item.updatedAt) < staleBefore;
+        return false;
+      })
       .sort(
         (a, b) =>
           businessTimestamp(a.remindAt) - businessTimestamp(b.remindAt),
@@ -423,10 +452,20 @@ export class AppService {
     let failed = 0;
 
     for (const subscription of due) {
+      // Atomically mark "processing" so a concurrent scheduler run cannot
+      // pick the same subscription and double-send.
+      this.store.reminderSubscriptions.set(subscription.id, {
+        ...subscription,
+        status: "processing",
+        updatedAt: nowIso(),
+      });
       const user = this.store.users.get(subscription.userId);
       const lesson = this.store.lessons.get(subscription.lessonId);
       const trainingClass = lesson
         ? this.store.classes.get(lesson.classId)
+        : undefined;
+      const child = trainingClass
+        ? this.store.children.get(trainingClass.childId)
         : undefined;
       if (!user?.wechatOpenid) {
         this.failReminderSubscription(subscription, "用户未绑定微信 openid");
@@ -448,7 +487,13 @@ export class AppService {
       }
 
       try {
-        await this.sendLessonReminder(user.wechatOpenid, subscription, lesson, trainingClass);
+        await this.wechat.sendLessonReminder(
+          user.wechatOpenid,
+          subscription,
+          lesson,
+          trainingClass,
+          child?.name,
+        );
         this.store.reminderSubscriptions.set(subscription.id, {
           ...subscription,
           status: "sent",
@@ -631,10 +676,6 @@ export class AppService {
         body.historicalUsedHours === undefined
           ? current.historicalUsedHours ?? current.usedHours
           : Number(body.historicalUsedHours),
-      usedHours:
-        body.usedHours === undefined
-          ? current.usedHours
-          : Number(body.usedHours),
       totalFee:
         body.totalFee === undefined ? current.totalFee : Number(body.totalFee),
       startTime:
@@ -662,24 +703,18 @@ export class AppService {
           : (optionalString(body.notes) ?? null),
     };
     if (
-      !Number.isInteger(updated.usedHours) ||
-      updated.usedHours < 0 ||
-      updated.usedHours > updated.totalHours
-    )
-      throw badRequest("usedHours must be between 0 and totalHours");
-    if (
       !Number.isInteger(updated.historicalUsedHours ?? 0) ||
       (updated.historicalUsedHours ?? 0) < 0 ||
       (updated.historicalUsedHours ?? 0) > updated.totalHours
     )
       throw badRequest("historicalUsedHours must be between 0 and totalHours");
+    // usedHours / remainingHours are always derived from attendance + history,
+    // never trusted from client input (prevents drift / overdraft).
     const completedLessons = [...this.store.lessons.values()].filter(
       (lesson) => lesson.classId === classId && this.lessonAttendanceStatus(lesson) === "checked_in",
     ).length;
-    updated.usedHours = Math.max(
-      completedLessons + (updated.historicalUsedHours ?? 0),
-      updated.usedHours,
-    );
+    updated.usedHours =
+      completedLessons + (updated.historicalUsedHours ?? 0);
     updated.remainingHours = Math.max(
       0,
       updated.totalHours - updated.usedHours,
@@ -733,7 +768,11 @@ export class AppService {
       ...original,
       totalHours: original.totalHours + additionalHours,
       totalFee: original.totalFee + additionalFee,
-      remainingHours: original.remainingHours + additionalHours,
+      // Derive remaining from total - used rather than trusting the stored value.
+      remainingHours: Math.max(
+        0,
+        original.totalHours + additionalHours - original.usedHours,
+      ),
       updatedAt: nowIso(),
       status: "active",
     };
@@ -1822,10 +1861,6 @@ export class AppService {
     });
   }
 
-  private revertClassUsage(classId: string) {
-    this.refreshClassUsage(classId);
-  }
-
   private countUsedHours(classId: string) {
     const trainingClass = this.store.classes.get(classId);
     if (!trainingClass) return 0;
@@ -1854,105 +1889,6 @@ export class AppService {
     return trainingClass.totalFee / trainingClass.totalHours;
   }
 
-  private async fetchWeChatOpenid(code: string) {
-    if (!this.config.wechatAppId || !this.config.wechatAppSecret) {
-      throw badRequest("WECHAT_APP_ID and WECHAT_APP_SECRET are required", [
-        { field: "code", message: "服务端尚未配置微信小程序 appid/secret" },
-      ]);
-    }
-    const url = new URL("https://api.weixin.qq.com/sns/jscode2session");
-    url.searchParams.set("appid", this.config.wechatAppId);
-    url.searchParams.set("secret", this.config.wechatAppSecret);
-    url.searchParams.set("js_code", code);
-    url.searchParams.set("grant_type", "authorization_code");
-    let result: JsonResponse<WeChatErrorBody & { openid?: string }>;
-    try {
-      result = await requestJson<WeChatErrorBody & { openid?: string }>(url);
-    } catch (error) {
-      throw businessError("WECHAT_SESSION_REQUEST_FAILED", "微信登录凭证校验请求失败", [
-        {
-          field: "code",
-          message: error instanceof Error ? error.message : "无法连接微信接口",
-        },
-      ]);
-    }
-    const body = result.body;
-    if (result.status < 200 || result.status >= 300 || !body.openid) {
-      const detail = body.errcode
-        ? `${body.errmsg ?? "微信登录凭证校验失败"} (${body.errcode})`
-        : (body.errmsg ?? `微信接口返回 HTTP ${result.status}`);
-      throw businessError("WECHAT_SESSION_FAILED", "微信登录凭证校验失败", [
-        {
-          field: "code",
-          message: detail,
-        },
-      ]);
-    }
-    return body.openid;
-  }
-
-  private async sendLessonReminder(
-    openid: string,
-    subscription: LessonReminderSubscription,
-    lesson: Lesson,
-    trainingClass: TrainingClass,
-  ) {
-    const accessToken = await this.getWeChatAccessToken();
-    const child = this.store.children.get(trainingClass.childId);
-    const result = await requestJson<WeChatErrorBody>(
-      `https://api.weixin.qq.com/cgi-bin/message/subscribe/send?access_token=${encodeURIComponent(accessToken)}`,
-      {
-        method: "POST",
-        body: {
-          touser: openid,
-          template_id: subscription.templateId,
-          page: subscription.page ?? `/pages/class-detail/index?classId=${trainingClass.id}`,
-          data: buildLessonReminderTemplateData(
-            subscription,
-            lesson,
-            trainingClass,
-            child?.name,
-          ),
-        },
-      },
-    );
-    const body = result.body;
-    if (result.status < 200 || result.status >= 300 || body.errcode !== 0) {
-      throw new Error(body.errmsg ?? "微信订阅消息发送失败");
-    }
-  }
-
-  private async getWeChatAccessToken() {
-    if (!this.config.wechatAppId || !this.config.wechatAppSecret) {
-      throw new Error("WECHAT_APP_ID and WECHAT_APP_SECRET are required");
-    }
-    if (
-      cachedWechatAccessToken &&
-      cachedWechatAccessToken.expiresAt > Date.now() + 60_000
-    ) {
-      return cachedWechatAccessToken.token;
-    }
-    const url = new URL("https://api.weixin.qq.com/cgi-bin/token");
-    url.searchParams.set("grant_type", "client_credential");
-    url.searchParams.set("appid", this.config.wechatAppId);
-    url.searchParams.set("secret", this.config.wechatAppSecret);
-    const result = await requestJson<{
-      access_token?: string;
-      expires_in?: number;
-      errcode?: number;
-      errmsg?: string;
-    }>(url);
-    const body = result.body;
-    if (result.status < 200 || result.status >= 300 || !body.access_token) {
-      throw new Error(body.errmsg ?? "获取微信 access_token 失败");
-    }
-    cachedWechatAccessToken = {
-      token: body.access_token,
-      expiresAt: Date.now() + (body.expires_in ?? 7200) * 1000,
-    };
-    return body.access_token;
-  }
-
   private failReminderSubscription(
     subscription: LessonReminderSubscription,
     failureReason: string,
@@ -1970,19 +1906,48 @@ function nowIso() {
   return nowLocalIso();
 }
 
-function hashPassword(phone: string, password: string) {
+/** Async scrypt so login/registration don't block the event loop. The
+ *  computationally expensive KDF runs on the libuv thread pool. */
+function scryptAsync(password: string, salt: string, keylen: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    scrypt(password, salt, keylen, (error, derived) => {
+      if (error) reject(error);
+      else resolve(derived);
+    });
+  });
+}
+
+async function hashPassword(phone: string, password: string) {
   const salt = randomBytes(16).toString("hex");
-  const passwordHash = scryptSync(password, salt, 64).toString("hex");
+  const passwordHash = (await scryptAsync(password, salt, 64)).toString("hex");
   return { phone, passwordHash, salt, createdAt: nowIso() };
 }
 
-function verifyPassword(
+async function verifyPassword(
   password: string,
   credential: { passwordHash: string; salt: string },
 ) {
   const expected = Buffer.from(credential.passwordHash, "hex");
-  const actual = scryptSync(password, credential.salt, expected.length);
+  const actual = await scryptAsync(password, credential.salt, expected.length);
   return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+/** Verifies the HMAC signature suffix on a bearer token (defense in depth). */
+function verifyTokenSignature(token: string, secret: string): boolean {
+  const dot = token.lastIndexOf(".");
+  if (dot <= 0) return false;
+  const raw = token.slice(0, dot);
+  const signature = token.slice(dot + 1);
+  const expected = Buffer.from(
+    createHmac("sha256", secret).update(raw).digest("hex"),
+    "hex",
+  );
+  const actual = Buffer.from(signature, "hex");
+  return (
+    expected.length > 0 &&
+    expected.length === actual.length &&
+    timingSafeEqual(expected, actual)
+  );
 }
 
 function defaultReminderSettings(familyId: string): ReminderSettings {
@@ -2002,85 +1967,6 @@ function defaultThemePreference(userId: string): ThemePreference {
 
 function byScheduledDate(a: Lesson, b: Lesson) {
   return businessTimestamp(a.scheduledDate) - businessTimestamp(b.scheduledDate);
-}
-
-function truncateTemplateValue(value: string, maxLength: number) {
-  return value.length > maxLength ? value.slice(0, maxLength) : value;
-}
-
-function formatTemplateDateTime(value: string) {
-  const date = parseBusinessDateTime(value);
-  const parts = businessDateParts(date);
-  const month = `${parts.month + 1}`.padStart(2, "0");
-  const day = `${parts.day}`.padStart(2, "0");
-  const hour = `${parts.hour}`.padStart(2, "0");
-  const minute = `${parts.minute}`.padStart(2, "0");
-  return `${parts.year}年${month}月${day}日 ${hour}:${minute}`;
-}
-
-function requestJson<T>(
-  input: URL | string,
-  options: JsonRequestOptions = {},
-): Promise<JsonResponse<T>> {
-  const url = typeof input === "string" ? new URL(input) : input;
-  const body =
-    options.body === undefined ? undefined : JSON.stringify(options.body);
-
-  return new Promise((resolve, reject) => {
-    const req = httpsRequest(
-      {
-        protocol: url.protocol,
-        hostname: url.hostname,
-        port: url.port || 443,
-        path: `${url.pathname}${url.search}`,
-        method: options.method ?? (body ? "POST" : "GET"),
-        timeout: 10_000,
-        rejectUnauthorized:
-          process.env.WECHAT_TLS_REJECT_UNAUTHORIZED === "true",
-        headers: {
-          accept: "application/json",
-          ...(body
-            ? {
-                "content-type": "application/json",
-                "content-length": Buffer.byteLength(body),
-              }
-            : {}),
-        },
-        lookup(hostname, opts, callback) {
-          dnsLookup(hostname, { ...opts, family: 4 }, callback);
-        },
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (chunk: Buffer) => chunks.push(chunk));
-        res.on("end", () => {
-          const raw = Buffer.concat(chunks).toString("utf8");
-          try {
-            resolve({
-              status: res.statusCode ?? 0,
-              body: (raw ? JSON.parse(raw) : {}) as T,
-            });
-          } catch {
-            reject(
-              new Error(
-                `微信接口返回非 JSON 响应 HTTP ${res.statusCode ?? 0}`,
-              ),
-            );
-          }
-        });
-      },
-    );
-    req.on("timeout", () => req.destroy(new Error("微信接口请求超时")));
-    req.on("error", (error) => {
-      const detail =
-        "code" in error && typeof error.code === "string"
-          ? `${error.message} (${error.code})`
-          : error.message;
-      reject(new Error(detail));
-    });
-    if (body) req.write(body);
-    req.end();
-  });
 }
 
 function countsTowardClassHours(lesson: Lesson) {

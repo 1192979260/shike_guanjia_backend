@@ -1,4 +1,6 @@
 const baseUrl = process.env.BASE_URL ?? 'http://localhost:3000';
+const phone = `138${Date.now().toString().slice(-8)}`;
+const password = 'smoke-test-123';
 
 async function request(path, options = {}) {
   const response = await fetch(`${baseUrl}${path}`, {
@@ -16,9 +18,8 @@ async function request(path, options = {}) {
   return payload.data ?? payload;
 }
 
-await request('/api/auth/send-code', { method: 'POST', body: { phone: '13800138000' } });
-const login = await request('/api/auth/login', { method: 'POST', body: { phone: '13800138000', code: '123456' } });
-const token = login.token;
+const register = await request('/api/auth/register', { method: 'POST', body: { phone, password } });
+const token = register.token;
 const child = await request('/api/children', { method: 'POST', token, body: { name: '小宝', age: 6 } });
 const trainingClass = await request('/api/classes', {
   method: 'POST',
@@ -30,7 +31,7 @@ const trainingClass = await request('/api/classes', {
     courseName: '美术启蒙',
     totalHours: 4,
     totalFee: 400,
-    startTime: '2026-06-15T09:00:00.000Z',
+    startTime: '2026-06-15T09:00:00.000',
     recurringRule: {
       type: 'weekly',
       daysOfWeek: [1],
@@ -54,4 +55,4 @@ const leave = await request('/api/leaves', {
 });
 const cost = await request('/api/cost/monthly?year=2026&month=6', { token });
 
-console.log(JSON.stringify({ user: login.user.phone, child: child.name, classId: trainingClass.id, lessonCount: lessons.length, leaveId: leave.id, totalCost: cost.totalCost }, null, 2));
+console.log(JSON.stringify({ user: register.user.phone, child: child.name, classId: trainingClass.id, lessonCount: lessons.length, leaveId: leave.id, totalCost: cost.totalCost }, null, 2));

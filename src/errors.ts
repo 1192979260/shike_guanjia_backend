@@ -17,6 +17,7 @@ export const unauthorized = (message = 'Unauthorized') => new HttpError(401, 'UN
 export const forbidden = (message = 'Forbidden') => new HttpError(403, 'FORBIDDEN', message);
 export const notFound = (message = 'Not found') => new HttpError(404, 'NOT_FOUND', message);
 export const conflict = (message = 'Conflict') => new HttpError(409, 'CONFLICT', message);
+export const rateLimited = (message = 'Too many requests') => new HttpError(429, 'RATE_LIMITED', message);
 
 export function errorBody(error: unknown) {
   if (error instanceof HttpError) {

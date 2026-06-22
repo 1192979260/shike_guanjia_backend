@@ -22,6 +22,9 @@ This is a TypeScript Node.js backend for the 课时管家 Flutter app. Keep API 
 
 - Protected routes use `Authorization: Bearer <token>` and scope access by authenticated family.
 - Successful JSON responses are `{ "data": ... }`; errors are `{ "error": { "code", "message", "fields" } }`.
-- Default storage is SQLite at `.data/shike-guanjia.sqlite`; `STORAGE_MODE=memory` is disposable and `STORAGE_MODE=file` uses `DATA_FILE`.
-- Non-production verification code defaults to `123456`; do not treat it as production SMS behavior.
+- Default storage is MySQL via `DATABASE_URL`; `STORAGE_MODE=memory` is disposable and `STORAGE_MODE=file` uses `DATA_FILE`.
+- Authentication is phone + password (no SMS verification code flow). Tokens are HMAC-signed opaque strings with a `MAX_SESSION_AGE_MS` TTL and signature verification on each auth.
 - Check-in must remain idempotent per lesson. Leave cancellation must restore the original lesson and remove generated makeup lessons.
+- Multi-step writes must run inside `store.runInTransaction` so they commit atomically. Never re-introduce whole-table wipe-and-reinsert persistence.
+- Login is rate-limited per phone (`LOGIN_MAX_ATTEMPTS` / `LOGIN_LOCKOUT_MS`); keep that guard when touching the auth path.
+- Production startup (`validateConfig`) must reject missing/default `TOKEN_SECRET` and missing `DATABASE_URL`. Keep it strict.

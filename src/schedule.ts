@@ -1,4 +1,4 @@
-import type { Lesson, LessonTimeSlot, RecurringRule, TrainingClass } from './types.js';
+import type { Lesson, LessonTimeSlot, TrainingClass } from './types.js';
 import {
   businessDateFromParts,
   businessDateParts,

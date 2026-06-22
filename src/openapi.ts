@@ -41,6 +41,16 @@ export const openApiSpec = {
           password: { type: "string", example: "password123" },
         },
       },
+      WeChatSessionRequest: {
+        type: "object",
+        properties: {
+          code: { type: "string", description: "微信登录凭证 code" },
+          openid: {
+            type: "string",
+            description: "仅非生产环境允许直接传入，用于调试/测试",
+          },
+        },
+      },
       ChildCreateRequest: {
         type: "object",
         required: ["name"],
@@ -259,6 +269,60 @@ export const openApiSpec = {
           notes: { type: "string", nullable: true },
         },
       },
+      ReminderSubscriptionRequest: {
+        type: "object",
+        required: ["templateId", "lessonIds"],
+        properties: {
+          templateId: { type: "string", description: "微信订阅消息模板 ID" },
+          advanceMinutes: { type: "integer", enum: [15, 30, 60, 120, 1440] },
+          lessonIds: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 1 },
+          page: { type: "string", nullable: true },
+        },
+      },
+      LessonChangeRequest: {
+        type: "object",
+        required: ["lessonId", "type", "newScheduledDate"],
+        properties: {
+          lessonId: { type: "string" },
+          type: { type: "string", enum: ["leave", "reschedule"] },
+          source: { type: "string", enum: ["student", "teacher", "institution", "holiday", "other"] },
+          reason: { type: "string", nullable: true },
+          description: { type: "string", nullable: true },
+          newScheduledDate: { type: "string", format: "date-time" },
+          newScheduledEndDate: { type: "string", format: "date-time", nullable: true },
+        },
+      },
+      LessonLeaveRequest: {
+        type: "object",
+        properties: {
+          scheduledDate: { type: "string", format: "date-time", description: "补课时间，兼容旧前端字段" },
+          scheduledEndDate: { type: "string", format: "date-time", nullable: true },
+          newScheduledDate: { type: "string", format: "date-time", description: "补课时间" },
+          newScheduledEndDate: { type: "string", format: "date-time", nullable: true },
+          reason: { type: "string", nullable: true },
+          description: { type: "string", nullable: true },
+        },
+      },
+      LessonRescheduleRequest: {
+        type: "object",
+        required: ["newScheduledDate"],
+        properties: {
+          newScheduledDate: { type: "string", format: "date-time" },
+          newScheduledEndDate: { type: "string", format: "date-time", nullable: true },
+          reason: { type: "string", nullable: true },
+          description: { type: "string", nullable: true },
+        },
+      },
+      BackfillCheckInRequest: {
+        type: "object",
+        required: ["lessonId"],
+        properties: {
+          lessonId: { type: "string" },
+          actualStartTime: { type: "string", format: "date-time", nullable: true },
+          actualEndTime: { type: "string", format: "date-time", nullable: true },
+          notes: { type: "string", nullable: true },
+        },
+      },
       LeaveRequest: {
         type: "object",
         required: ["lessonId"],
@@ -296,6 +360,7 @@ export const openApiSpec = {
   },
   paths: {
     "/health": { get: operation("Auth", "健康检查", false) },
+    "/health/ready": { get: operation("Auth", "深度健康检查", false) },
     "/api/auth/register": {
       post: operation("Auth", "手机号密码注册", false, "RegisterRequest"),
     },
@@ -304,6 +369,9 @@ export const openApiSpec = {
     },
     "/api/auth/me": { get: operation("Auth", "获取当前用户和家庭") },
     "/api/auth/logout": { post: operation("Auth", "退出登录") },
+    "/api/auth/wechat-session": {
+      post: operation("Auth", "绑定微信 openid", true, "WeChatSessionRequest"),
+    },
     "/api/family": { get: operation("Auth", "获取当前家庭") },
     "/api/family/members": {
       get: operation("Auth", "获取家庭成员"),
@@ -333,6 +401,14 @@ export const openApiSpec = {
         "ReminderSettingsUpdateRequest",
       ),
     },
+    "/api/reminder-subscriptions": {
+      post: operation(
+        "Preferences",
+        "登记微信订阅消息提醒",
+        true,
+        "ReminderSubscriptionRequest",
+      ),
+    },
     "/api/preferences/theme": {
       get: operation("Preferences", "获取主题偏好"),
       patch: operation(
@@ -344,7 +420,7 @@ export const openApiSpec = {
     },
 
     "/api/children": {
-      get: operation("Children", "孩子列表"),
+      get: operation("Children", "孩子列表", true, undefined, queryParams(["page", "pageSize"])),
       post: operation("Children", "创建孩子", true, "ChildCreateRequest"),
     },
     "/api/children/{childId}": pathItem(
@@ -369,7 +445,7 @@ export const openApiSpec = {
         "班级列表",
         true,
         undefined,
-        queryParams(["childId", "status"]),
+        queryParams(["childId", "status", "page", "pageSize"]),
       ),
       post: operation(
         "Classes",
@@ -422,6 +498,15 @@ export const openApiSpec = {
         pathParam("classId"),
       ),
     },
+    "/api/classes/{classId}/schedule-rule": {
+      patch: operation(
+        "Classes",
+        "更新班级排课规则",
+        true,
+        "ClassCreateRequest",
+        pathParam("classId"),
+      ),
+    },
     "/api/classes/{classId}/generate-lessons": {
       post: operation(
         "Classes",
@@ -431,10 +516,28 @@ export const openApiSpec = {
         pathParam("classId"),
       ),
     },
+    "/api/classes/{classId}/regenerate-lessons": {
+      post: operation(
+        "Classes",
+        "重新生成课次（兼容别名）",
+        true,
+        undefined,
+        pathParam("classId"),
+      ),
+    },
     "/api/classes/{classId}/lessons": {
       get: operation(
         "Lessons",
         "班级课次",
+        true,
+        undefined,
+        pathParam("classId"),
+      ),
+    },
+    "/api/classes/{classId}/lesson-change-records": {
+      get: operation(
+        "Lessons",
+        "班级调课/请假记录",
         true,
         undefined,
         pathParam("classId"),
@@ -456,10 +559,11 @@ export const openApiSpec = {
         "按日期范围查询课次",
         true,
         undefined,
-        queryParams(["start", "end", "childId", "classId"]),
+        queryParams(["start", "end", "childId", "classId", "page", "pageSize"]),
       ),
     },
     "/api/lessons/today": { get: operation("Lessons", "今日课次") },
+    "/api/lessons/home": { get: operation("Lessons", "首页课次聚合") },
     "/api/lessons/upcoming": {
       get: operation(
         "Lessons",
@@ -478,6 +582,24 @@ export const openApiSpec = {
       ["get", "patch", "delete"],
       "LessonUpdateRequest",
     ),
+    "/api/lessons/{lessonId}/reschedule": {
+      post: operation(
+        "Lessons",
+        "调整课次时间",
+        true,
+        "LessonRescheduleRequest",
+        pathParam("lessonId"),
+      ),
+    },
+    "/api/lessons/{lessonId}/leave": {
+      post: operation(
+        "Leaves",
+        "为课次请假并登记补课时间",
+        true,
+        "LessonLeaveRequest",
+        pathParam("lessonId"),
+      ),
+    },
     "/api/lessons/{lessonId}/conflicts": {
       get: operation(
         "Lessons",
@@ -503,6 +625,9 @@ export const openApiSpec = {
     "/api/attendance/check-in": {
       post: operation("Attendance", "上课打卡/补录", true, "CheckInRequest"),
     },
+    "/api/lessons/backfill-check-in": {
+      post: operation("Attendance", "课次补录打卡", true, "BackfillCheckInRequest"),
+    },
     "/api/attendance/lessons/{lessonId}/cancel": {
       post: operation(
         "Attendance",
@@ -518,7 +643,7 @@ export const openApiSpec = {
         "查询考勤记录",
         true,
         undefined,
-        queryParams(["start", "end", "childId", "classId", "lessonId"]),
+        queryParams(["start", "end", "childId", "classId", "lessonId", "page", "pageSize"]),
       ),
     },
     "/api/attendance/backdated": { get: operation("Attendance", "可补录课次") },
@@ -541,6 +666,36 @@ export const openApiSpec = {
       ),
     },
 
+    "/api/lesson-changes": {
+      post: operation("Lessons", "创建调课/请假变更", true, "LessonChangeRequest"),
+    },
+    "/api/lesson-changes/history": {
+      get: operation(
+        "Lessons",
+        "调课/请假历史",
+        true,
+        undefined,
+        queryParams(["childId", "classId", "startDate", "endDate", "page", "pageSize"]),
+      ),
+    },
+    "/api/lesson-changes/{changeId}/cancel": {
+      post: operation(
+        "Lessons",
+        "取消调课/请假变更",
+        true,
+        undefined,
+        pathParam("changeId"),
+      ),
+    },
+    "/api/lesson-change-records/{changeId}/revoke": {
+      post: operation(
+        "Lessons",
+        "撤销调课/请假记录（兼容别名）",
+        true,
+        undefined,
+        pathParam("changeId"),
+      ),
+    },
     "/api/leaves": { post: operation("Leaves", "请假", true, "LeaveRequest") },
     "/api/leaves/history": {
       get: operation(
@@ -548,7 +703,7 @@ export const openApiSpec = {
         "请假历史",
         true,
         undefined,
-        queryParams(["childId", "startDate", "endDate"]),
+        queryParams(["childId", "startDate", "endDate", "page", "pageSize"]),
       ),
     },
     "/api/leaves/makeup-lessons": { get: operation("Leaves", "补课课次") },
@@ -740,7 +895,9 @@ function queryParams(names: string[]) {
         name === "year" ||
         name === "month" ||
         name === "days" ||
-        name === "months"
+        name === "months" ||
+        name === "page" ||
+        name === "pageSize"
           ? "integer"
           : "string",
     },

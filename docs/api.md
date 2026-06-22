@@ -12,7 +12,8 @@
 - Auth header: `Authorization: Bearer <token>`
 - JSON response envelope: successful JSON endpoints return `{ "data": ... }`; errors return `{ "error": { "code", "message", "fields" } }`.
 - Date fields use ISO-8601 strings. Payload field names and enum values intentionally match app `domain/models` serialization.
-- `GET /health` is unauthenticated and returns `{ "data": { "ok": true } }`.
+- `GET /health` is unauthenticated and returns `{ "data": { "ok": true } }`; `GET /health/ready` also probes MySQL readiness and returns 503 when the database is unavailable.
+- Mutation requests can send `Idempotency-Key: <uuid>`; duplicate successful requests with the same user/method/path/key return the cached result for 10 minutes instead of executing the write again.
 
 ## Auth And Family
 
@@ -20,6 +21,7 @@
 - `POST /api/auth/login` body `{ "phone": "13800138000", "password": "password123" }` returns `{ token, user, family }`
 - `GET /api/auth/me`
 - `POST /api/auth/logout`
+- `POST /api/auth/wechat-session` body `{ "code": "<wx-login-code>" }` binds the current user to a WeChat openid. Non-production may pass `{ "openid": "debug-openid" }` for local testing.
 - `GET /api/family`
 - `GET /api/family/members`
 - `POST /api/family/members` body `{ "phone": "13900139000", "relation": "father" }`
@@ -50,11 +52,12 @@ Family sharing errors use stable `error.code` values for Flutter display:
 
 - `GET /api/preferences/theme` returns the current user's theme preference. If no preference was saved, the default is `{ "skin": "warm" }`.
 - `PATCH /api/preferences/theme` body `{ "skin": "fresh" }`; `skin` must be `warm`, `fresh`, or `classic`.
+- `POST /api/reminder-subscriptions` body `{ "templateId": "...", "lessonIds": ["lesson-id"], "advanceMinutes": 60, "page": "/pages/class-detail/index?classId=..." }` records a WeChat subscription-message authorization for one scheduled lesson. The user must first bind a WeChat openid and enable reminders.
 
 ## Children
 
 - `POST /api/children` body `{ "name": "小宝", "age": 6, "avatarUrl": null }`
-- `GET /api/children`
+- `GET /api/children?page=1&pageSize=20`
 - `GET /api/children/:childId`
 - `GET /api/children/:childId/classes`
 - `PATCH /api/children/:childId`
@@ -63,7 +66,7 @@ Family sharing errors use stable `error.code` values for Flutter display:
 ## Classes And Lessons
 
 - `POST /api/classes` creates an active class and generated lessons.
-- `GET /api/classes?childId=<id>&status=active`
+- `GET /api/classes?childId=<id>&status=active&page=1&pageSize=20`
 - `GET /api/classes/active`
 - `GET /api/classes/completed`
 - `GET /api/classes/:classId`
@@ -73,15 +76,21 @@ Family sharing errors use stable `error.code` values for Flutter display:
 - `POST /api/classes/:classId/resume`
 - `POST /api/classes/:classId/end`
 - `POST /api/classes/:classId/renew` body `{ "newTotalHours": 20, "newTotalFee": 3000 }`
+- `PATCH /api/classes/:classId/schedule-rule` updates the class recurring rule/start time and regenerates future scheduled lessons.
 - `POST /api/classes/:classId/generate-lessons`
+- `POST /api/classes/:classId/regenerate-lessons` is a compatibility alias for generation.
 - `GET /api/classes/:classId/lessons`
+- `GET /api/classes/:classId/lesson-change-records`
 - `GET /api/classes/:classId/conflicts`
-- `GET /api/lessons/range?start=<iso>&end=<iso>&childId=<id>&classId=<id>`
+- `GET /api/lessons/range?start=<iso>&end=<iso>&childId=<id>&classId=<id>&page=1&pageSize=20`
 - `GET /api/lessons/today`
+- `GET /api/lessons/home` returns `{ todayLessons, needsBackfillLessons }` for home-page loading.
 - `GET /api/lessons/upcoming?days=3&childId=<id>&classId=<id>` returns scheduled lessons only; `days` is clamped to 1-30.
 - `POST /api/lessons/manual` body `{ "classId": "...", "scheduledDate": "2026-06-15T09:00:00.000Z", "scheduledEndDate": "2026-06-15T10:00:00.000Z" }`; if `scheduledEndDate` is omitted, the backend infers it from the class time slot duration.
 - `GET /api/lessons/:lessonId`
 - `PATCH /api/lessons/:lessonId` supports `{ "scheduledDate", "scheduledEndDate", "status", "notes" }`. Changing `scheduledDate` shifts `scheduledEndDate` by the original lesson duration when no explicit end is provided. Completed lessons cannot change scheduled time.
+- `POST /api/lessons/:lessonId/reschedule` body `{ "newScheduledDate": "...", "newScheduledEndDate": "...", "reason": "...", "description": "..." }` creates a lesson-change record and moves the lesson.
+- `POST /api/lessons/:lessonId/leave` body `{ "scheduledDate": "...", "scheduledEndDate": "...", "reason": "..." }` requests leave and records the replacement time; `newScheduledDate`/`newScheduledEndDate` are also accepted.
 - `DELETE /api/lessons/:lessonId`
 - `GET /api/lessons/:lessonId/conflicts`
 - `POST /api/suspensions` body `{ "classId": "...", "start": "...", "end": "..." }`
@@ -119,17 +128,22 @@ Family sharing errors use stable `error.code` values for Flutter display:
   - `type=checkin` is allowed from 15 minutes before scheduled start through 2 hours after scheduled end.
   - Too-early attempts return `CHECKIN_TOO_EARLY` with `fields.allowedFrom`; late normal attempts return `CHECKIN_REQUIRES_BACKDATED`.
   - `type=backdated` is for past lessons and supports `actualStartTime`/`actualEndTime`; historical backfill after 7 days requires `notes`.
+- `POST /api/lessons/backfill-check-in` body `{ "lessonId": "...", "actualStartTime": "...", "actualEndTime": "...", "notes": "..." }` is a compatibility endpoint that forces `type=backdated`.
 - `POST /api/attendance/lessons/:lessonId/cancel` cancels a mistaken check-in, deletes that lesson's attendance record, restores the lesson to `scheduled`, and returns the consumed class hour.
-- `GET /api/attendance?start=<iso>&end=<iso>&childId=<id>&classId=<id>`
+- `GET /api/attendance?start=<iso>&end=<iso>&childId=<id>&classId=<id>&page=1&pageSize=20`
 - `GET /api/attendance?lessonId=<id>`
 - `GET /api/attendance/backdated` returns scheduled, unchecked lessons from the last 7 days with child/class/course display fields.
 - `GET /api/attendance/stats?year=2026&month=6&childId=<id>`
 - `GET /api/attendance/:attendanceId`
-- `POST /api/leaves` body `{ "lessonId": "...", "reason": "生病" }`
+- `POST /api/leaves` body `{ "lessonId": "...", "reason": "生病", "scheduledDate": "...", "scheduledEndDate": "..." }`
 - `POST /api/leaves/:leaveId/cancel`
 - `GET /api/leaves/:leaveId`
-- `GET /api/leaves/history?childId=<id>&startDate=<iso>&endDate=<iso>`
+- `GET /api/leaves/history?childId=<id>&startDate=<iso>&endDate=<iso>&page=1&pageSize=20`
 - `GET /api/leaves/makeup-lessons`
+- `POST /api/lesson-changes` body `{ "lessonId": "...", "type": "reschedule", "newScheduledDate": "...", "newScheduledEndDate": "...", "source": "other", "reason": "..." }`
+- `GET /api/lesson-changes/history?childId=<id>&classId=<id>&startDate=<iso>&endDate=<iso>&page=1&pageSize=20`
+- `POST /api/lesson-changes/:changeId/cancel`
+- `POST /api/lesson-change-records/:changeId/revoke` is a compatibility alias for cancelling a change record.
 
 ## Cost Reporting
 
@@ -142,5 +156,7 @@ Family sharing errors use stable `error.code` values for Flutter display:
 
 ## Productionization Gaps
 
-- Add production migration/backup tooling around the current SQLite key-value store, or replace it with LeanCloud/database repositories.
-- Add push reminders, system calendar integration, avatar/file upload storage, and operational monitoring.
+- AppService is still a large domain-service class; split it into auth, class, lesson, attendance, cost, reminder, and WeChat services as the next maintainability iteration.
+- Convert synchronous `scryptSync` password operations to async `scrypt` or a worker when login throughput becomes material.
+- Add `/api/v1` versioned routes through a coordinated frontend/backend release.
+- Add production backup/restore runbooks, operational dashboards, and alerting around MySQL and reminder delivery.

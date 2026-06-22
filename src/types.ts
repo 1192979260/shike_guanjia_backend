@@ -11,7 +11,7 @@ export type LessonChangeSource = 'student' | 'teacher' | 'institution' | 'holida
 export type LessonChangeLifecycleStatus = 'active' | 'cancelled';
 export type LessonChangeStatus = 'normal' | 'leave' | 'rescheduled' | 'cancelled';
 export type ThemeSkin = 'warm' | 'fresh' | 'classic';
-export type ReminderSubscriptionStatus = 'pending' | 'sent' | 'failed' | 'cancelled';
+export type ReminderSubscriptionStatus = 'pending' | 'processing' | 'sent' | 'failed' | 'cancelled';
 
 export interface User {
   id: string;

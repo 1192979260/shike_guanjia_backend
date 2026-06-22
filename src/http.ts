@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   createServer,
   type IncomingMessage,
@@ -6,6 +7,7 @@ import {
 import { businessEndOfDay, businessStartOfDay, toLocalIso } from "./date-time.js";
 import { HttpError, errorBody, notFound } from "./errors.js";
 import type { AppService, AuthContext } from "./app-service.js";
+import type { Config } from "./config.js";
 import { openApiSpec, swaggerHtml } from "./openapi.js";
 
 type Handler = (request: RequestContext) => Promise<unknown> | unknown;
@@ -26,14 +28,70 @@ export interface RequestContext {
   body: Record<string, unknown>;
   auth?: AuthContext;
   tokenHeader?: string;
+  requestId: string;
 }
 
-export function createApp(service: AppService) {
+const MAX_BODY_BYTES_DEFAULT = 1024 * 1024;
+const IDEMPOTENCY_TTL_MS = 10 * 60 * 1000;
+
+type IdempotencyEntry = {
+  result: unknown;
+  expiresAt: number;
+};
+
+export function createApp(service: AppService, config: Config) {
   const routes = buildRoutes(service);
+  // Per-instance request mutex: serializes the refresh → read → write cycle so
+  // concurrent requests cannot interleave and observe each other's half-applied
+  // state. This is the correctness fix for the cache race; the tradeoff is that
+  // request handling is single-threaded per instance (acceptable for this app's
+  // low QPS — a future targeted-query repository layer would remove the need).
+  let lockChain: Promise<void> = Promise.resolve();
+  const withLock = <T>(fn: () => T | Promise<T>): Promise<T> => {
+    const run = lockChain.then(fn, fn);
+    lockChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+  // Per-process idempotency cache for mutation requests. It prevents a client
+  // retry with the same key from executing the same state transition twice. This
+  // is intentionally short-lived and in-memory; a future multi-instance deploy can
+  // back it with MySQL/Redis using the same key semantics.
+  const idempotencyCache = new Map<string, IdempotencyEntry>();
+  const idempotencyScope = (ctx: RequestContext) => {
+    const rawKey = ctx.req.headers["idempotency-key"];
+    const key = Array.isArray(rawKey) ? rawKey[0] : rawKey;
+    if (!key || ctx.req.method === "GET") return null;
+    const actor = ctx.auth?.user.id ?? "anonymous";
+    return `${actor}:${ctx.req.method}:${ctx.url.pathname}:${key}`;
+  };
+  const getCachedIdempotentResult = (scope: string) => {
+    const entry = idempotencyCache.get(scope);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= Date.now()) {
+      idempotencyCache.delete(scope);
+      return undefined;
+    }
+    return entry.result;
+  };
+  const rememberIdempotentResult = (scope: string, result: unknown) => {
+    const now = Date.now();
+    for (const [key, entry] of idempotencyCache) {
+      if (entry.expiresAt <= now) idempotencyCache.delete(key);
+    }
+    idempotencyCache.set(scope, {
+      result,
+      expiresAt: now + IDEMPOTENCY_TTL_MS,
+    });
+  };
   return createServer(async (req, res) => {
     const startedAt = Date.now();
+    const requestId = randomUUID();
+    res.setHeader("x-request-id", requestId);
     try {
-      setCorsHeaders(req, res);
+      setCorsHeaders(req, res, config);
       if (req.method === "OPTIONS") {
         res.writeHead(204);
         res.end();
@@ -54,22 +112,37 @@ export function createApp(service: AppService) {
       }
       const routeMatch = matchRoute(routes, req.method ?? "GET", url.pathname);
       if (!routeMatch) throw notFound("Endpoint not found");
-      const body = await parseBody(req);
+      const body = await parseBody(req, config.maxBodyBytes);
       const tokenHeader = req.headers.authorization;
-      await service.store.refresh();
-      const auth = routeMatch.route.auth
-        ? service.authenticate(tokenHeader)
-        : undefined;
-      const result = await routeMatch.route.handler({
-        req,
-        res,
-        url,
-        params: routeMatch.params,
-        body,
-        auth,
-        tokenHeader,
+      const result = await withLock(async () => {
+        await service.store.refresh();
+        const auth = routeMatch.route.auth
+          ? service.authenticate(tokenHeader)
+          : undefined;
+        const context: RequestContext = {
+          req,
+          res,
+          url,
+          params: routeMatch.params,
+          body,
+          auth,
+          tokenHeader,
+          requestId,
+        };
+        const idempotencyKey = idempotencyScope(context);
+        if (idempotencyKey) {
+          const cached = getCachedIdempotentResult(idempotencyKey);
+          if (cached !== undefined) return cached;
+        }
+        // Wrap the handler in a transaction so all its writes commit atomically
+        // (no-op for memory/file stores; real DB transaction for mysql).
+        const value = await service.store.runInTransaction(async () =>
+          routeMatch.route.handler(context),
+        );
+        if (idempotencyKey) rememberIdempotentResult(idempotencyKey, value);
+        await service.store.waitForIdle();
+        return value;
       });
-      await service.store.waitForIdle();
       if (res.writableEnded) return;
       if (
         typeof result === "string" &&
@@ -83,28 +156,71 @@ export function createApp(service: AppService) {
     } catch (error) {
       const status = error instanceof HttpError ? error.status : 500;
       sendJson(res, status, errorBody(error));
-      if (!(error instanceof HttpError)) console.error(error);
+      if (!(error instanceof HttpError)) {
+        console.error(
+          JSON.stringify({
+            level: "error",
+            requestId,
+            method: req.method,
+            path: req.url,
+            error: error instanceof Error ? error.message : String(error),
+            stack: error instanceof Error ? error.stack : undefined,
+          }),
+        );
+      }
     } finally {
       console.info(
-        `${req.method} ${req.url} ${res.statusCode} ${Date.now() - startedAt}ms`,
+        JSON.stringify({
+          level: "info",
+          requestId,
+          method: req.method,
+          path: req.url,
+          status: res.statusCode,
+          durationMs: Date.now() - startedAt,
+        }),
       );
     }
   });
 }
 
-function setCorsHeaders(req: IncomingMessage, res: ServerResponse) {
+function setCorsHeaders(req: IncomingMessage, res: ServerResponse, config: Config) {
   const origin = req.headers.origin;
   res.setHeader("vary", "Origin");
-  res.setHeader(
-    "access-control-allow-origin",
-    typeof origin === "string" ? origin : "*",
-  );
-  res.setHeader(
-    "access-control-allow-methods",
-    "GET,POST,PATCH,DELETE,OPTIONS",
-  );
-  res.setHeader("access-control-allow-headers", "content-type,authorization");
-  res.setHeader("access-control-max-age", "86400");
+  const allowed =
+    typeof origin === "string" && isOriginAllowed(origin, config);
+  if (allowed) {
+    res.setHeader("access-control-allow-origin", origin);
+    res.setHeader("access-control-allow-methods", "GET,POST,PATCH,DELETE,OPTIONS");
+    res.setHeader("access-control-allow-headers", "content-type,authorization,idempotency-key");
+    res.setHeader("access-control-max-age", "86400");
+  }
+}
+
+function isOriginAllowed(origin: string, config: Config): boolean {
+  if (config.corsAllowedOrigins.length > 0)
+    return config.corsAllowedOrigins.includes(origin);
+  // No explicit allowlist: permit any origin in development for convenience,
+  // but in production an empty allowlist means no cross-origin access (same-origin
+  // and cloud-container traffic are unaffected).
+  return config.nodeEnv !== "production";
+}
+
+/** Wraps a list handler so that `?page=&pageSize=` returns a paginated envelope
+ *  `{ items, page, pageSize, total, hasMore }`. Without those params the raw
+ *  array is returned (backward compatible). */
+function paginate(handler: Handler): Handler {
+  return async (ctx) => {
+    const result = await handler(ctx);
+    if (!Array.isArray(result)) return result;
+    const page = Number(ctx.url.searchParams.get("page"));
+    const pageSize = Number(ctx.url.searchParams.get("pageSize"));
+    if (!Number.isInteger(page) || page < 1 || !Number.isInteger(pageSize) || pageSize < 1)
+      return result;
+    const total = result.length;
+    const start = (page - 1) * pageSize;
+    const items = result.slice(start, start + pageSize);
+    return { items, page, pageSize, total, hasMore: start + pageSize < total };
+  };
 }
 
 function buildRoutes(service: AppService): Route[] {
@@ -131,7 +247,8 @@ function buildRoutes(service: AppService): Route[] {
     return value;
   };
   return [
-    route("GET", "/health", false, () => ({ ok: true })),
+    route("GET", "/health", false, async () => service.healthCheck()),
+    route("GET", "/health/ready", false, async () => service.healthCheck(true)),
     route("POST", "/api/auth/register", false, (ctx) =>
       service.register(ctx.body.phone, ctx.body.password),
     ),
@@ -174,7 +291,7 @@ function buildRoutes(service: AppService): Route[] {
     route("POST", "/api/children", true, (ctx) =>
       service.createChild(a(ctx), ctx.body),
     ),
-    route("GET", "/api/children", true, (ctx) => service.listChildren(a(ctx))),
+    route("GET", "/api/children", true, paginate((ctx) => service.listChildren(a(ctx)))),
     route("GET", "/api/children/:childId", true, (ctx) =>
       service.getChild(a(ctx), p(ctx, "childId")),
     ),
@@ -194,9 +311,7 @@ function buildRoutes(service: AppService): Route[] {
     route("POST", "/api/classes", true, (ctx) =>
       service.createClass(a(ctx), ctx.body),
     ),
-    route("GET", "/api/classes", true, (ctx) =>
-      service.listClasses(a(ctx), q(ctx)),
-    ),
+    route("GET", "/api/classes", true, paginate((ctx) => service.listClasses(a(ctx), q(ctx)))),
     route("GET", "/api/classes/active", true, (ctx) =>
       service.listClasses(a(ctx), new URLSearchParams("status=active")),
     ),
@@ -248,9 +363,7 @@ function buildRoutes(service: AppService): Route[] {
         .flatMap((lesson) => service.checkLessonConflicts(a(ctx), lesson.id)),
     ),
 
-    route("GET", "/api/lessons/range", true, (ctx) =>
-      service.getLessonsInRange(a(ctx), q(ctx)),
-    ),
+    route("GET", "/api/lessons/range", true, paginate((ctx) => service.getLessonsInRange(a(ctx), q(ctx)))),
     route("GET", "/api/lessons/today", true, (ctx) => {
       const start = businessStartOfDay();
       const end = businessEndOfDay(start);
@@ -321,15 +434,11 @@ function buildRoutes(service: AppService): Route[] {
     route("GET", "/api/attendance/:attendanceId", true, (ctx) =>
       service.getAttendance(a(ctx), p(ctx, "attendanceId")),
     ),
-    route("GET", "/api/attendance", true, (ctx) =>
-      service.listAttendance(a(ctx), q(ctx)),
-    ),
+    route("GET", "/api/attendance", true, paginate((ctx) => service.listAttendance(a(ctx), q(ctx)))),
     route("POST", "/api/lesson-changes", true, (ctx) =>
       service.createLessonChange(a(ctx), ctx.body),
     ),
-    route("GET", "/api/lesson-changes/history", true, (ctx) =>
-      service.lessonChangeHistory(a(ctx), q(ctx)),
-    ),
+    route("GET", "/api/lesson-changes/history", true, paginate((ctx) => service.lessonChangeHistory(a(ctx), q(ctx)))),
     route("POST", "/api/lesson-changes/:changeId/cancel", true, (ctx) =>
       service.cancelLessonChange(a(ctx), p(ctx, "changeId")),
     ),
@@ -339,9 +448,7 @@ function buildRoutes(service: AppService): Route[] {
     route("POST", "/api/leaves", true, (ctx) =>
       service.requestLeave(a(ctx), ctx.body),
     ),
-    route("GET", "/api/leaves/history", true, (ctx) =>
-      service.leaveHistory(a(ctx), q(ctx)),
-    ),
+    route("GET", "/api/leaves/history", true, paginate((ctx) => service.leaveHistory(a(ctx), q(ctx)))),
     route("GET", "/api/leaves/makeup-lessons", true, (ctx) =>
       service.makeupLessons(a(ctx)),
     ),
@@ -369,6 +476,10 @@ function buildRoutes(service: AppService): Route[] {
     ),
     route("GET", "/api/cost/export.csv", true, (ctx) => {
       ctx.res.setHeader("content-type", "text/csv; charset=utf-8");
+      ctx.res.setHeader(
+        "content-disposition",
+        'attachment; filename="cost-export.csv"',
+      );
       return service.exportCostCsv(a(ctx), q(ctx));
     }),
   ];
@@ -389,11 +500,23 @@ function matchRoute(routes: Route[], method: string, pathname: string) {
 
 async function parseBody(
   req: IncomingMessage,
+  maxBodyBytes = MAX_BODY_BYTES_DEFAULT,
 ): Promise<Record<string, unknown>> {
   if (req.method === "GET" || req.method === "DELETE") return {};
+  const declared = Number(req.headers["content-length"] ?? 0);
+  if (Number.isFinite(declared) && declared > maxBodyBytes) {
+    throw new HttpError(413, "PAYLOAD_TOO_LARGE", "Request body too large");
+  }
   const chunks: Buffer[] = [];
-  for await (const chunk of req)
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  let received = 0;
+  for await (const chunk of req) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    received += buf.length;
+    if (received > maxBodyBytes) {
+      throw new HttpError(413, "PAYLOAD_TOO_LARGE", "Request body too large");
+    }
+    chunks.push(buf);
+  }
   const raw = Buffer.concat(chunks).toString("utf8");
   if (!raw) return {};
   return JSON.parse(raw) as Record<string, unknown>;
