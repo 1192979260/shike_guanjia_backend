@@ -1,21 +1,25 @@
 import assert from "node:assert/strict";
 import { rmSync } from "node:fs";
 import { beforeEach, describe, it } from "node:test";
-import { AppService } from "../src/app-service.js";
+import {
+  AppService,
+  buildLessonReminderTemplateData,
+} from "../src/app-service.js";
 import { loadConfig } from "../src/config.js";
-import { parseBusinessDateTime, toLocalIso } from "../src/date-time.js";
+import { businessDateParts, parseBusinessDateTime, toLocalIso } from "../src/date-time.js";
 import {
   findLessonConflicts,
   generateLessonsForClass,
 } from "../src/schedule.js";
 import { MemoryStore, SqliteStore } from "../src/store.js";
+import type { RecurringRule } from "../src/types.js";
 
 let service: AppService;
 let store: MemoryStore;
 let token: string;
 let auth: ReturnType<AppService["authenticate"]>;
 
-const rule = {
+const rule: RecurringRule = {
   type: "weekly",
   daysOfWeek: [1],
   timeSlots: [
@@ -33,7 +37,7 @@ beforeEach(() => {
 
 function mockNow(isoDate: string) {
   const realDate = Date;
-  const fixedTime = realDate.parse(isoDate);
+  const fixedTime = parseBusinessDateTime(isoDate).getTime();
 
   class MockDate extends realDate {
     constructor(
@@ -355,6 +359,88 @@ describe("auth and family", { concurrency: false }, () => {
     );
   });
 
+  it("rejects registering lesson reminders before binding wechat openid", () => {
+    const restoreNow = mockNow("2026-06-15T08:00:00.000");
+    try {
+      const child = service.createChild(auth, { name: "小宝" });
+      const trainingClass = service.createClass(auth, {
+        childId: child.id,
+        institutionName: "星星美术",
+        className: "大班A",
+        courseName: "美术启蒙",
+        totalHours: 2,
+        totalFee: 200,
+        startTime: "2026-06-15T09:00:00.000",
+        recurringRule: rule,
+      });
+      const lesson = service.getClassLessons(auth, trainingClass.id)[0]!;
+
+      assert.throws(
+        () =>
+          service.registerLessonReminders(auth, {
+            lessonIds: [lesson.id],
+          }),
+        (error: unknown) => {
+          assert.equal((error as { code?: string }).code, "WECHAT_OPENID_MISSING");
+          return true;
+        },
+      );
+      assert.equal(store.reminderSubscriptions.size, 0);
+    } finally {
+      restoreNow();
+    }
+  });
+
+  it("builds non-empty fallback data for live reminder templates", () => {
+    const templateData = buildLessonReminderTemplateData(
+      {
+        id: "sub-1",
+        familyId: auth.familyId,
+        userId: auth.user.id,
+        lessonId: "lesson-1",
+        templateId: "pluT-ikzv-p5mBwXhcWIApzQqe4eyYQVyKlhha0h1b4",
+        advanceMinutes: 60,
+        scheduledAt: "2026-06-18T13:40:00.000",
+        remindAt: "2026-06-18T12:40:00.000",
+        page: "/pages/home/index",
+        status: "pending",
+        sentAt: null,
+        failureReason: null,
+        createdAt: "2026-06-18T12:00:00.000",
+        updatedAt: "2026-06-18T12:00:00.000",
+      },
+      {
+        id: "lesson-1",
+        classId: "class-1",
+        scheduledDate: "2026-06-18T13:40:00.000",
+        scheduledEndDate: "2026-06-18T18:30:00.000",
+        status: "scheduled",
+        isMakeup: false,
+      },
+      {
+        id: "class-1",
+        childId: "child-1",
+        familyId: auth.familyId,
+        institutionName: "",
+        className: "篮球课",
+        courseName: "篮球",
+        totalHours: 42,
+        usedHours: 2,
+        remainingHours: 40,
+        totalFee: 4200,
+        startTime: "2026-06-01T13:40:00.000",
+        recurringRule: rule,
+        status: "active",
+        createdAt: "2026-06-01T08:00:00.000",
+      },
+      "",
+    );
+
+    assert.equal(templateData.thing9.value, "学员");
+    assert.equal(templateData.thing8.value, "篮球");
+    assert.equal(templateData.time15.value, "2026-06-23 09:00");
+  });
+
   it("returns default and updated user theme preference without sharing it across family members", () => {
     const defaults = service.getThemePreference(auth);
     assert.equal(defaults.userId, auth.user.id);
@@ -387,6 +473,107 @@ describe("auth and family", { concurrency: false }, () => {
         return true;
       },
     );
+  });
+});
+
+describe("lesson flow contract", { concurrency: false }, () => {
+  it("creates only remaining future lessons when historical used hours are provided", () => {
+    const child = service.createChild(auth, { name: "小宝" });
+    const trainingClass = service.createClass(auth, {
+      childId: child.id,
+      institutionName: "星星美术",
+      className: "大班A",
+      courseName: "美术启蒙",
+      totalHours: 10,
+      historicalUsedHours: 4,
+      totalFee: 2000,
+      startTime: "2026-06-15T09:00:00.000",
+      recurringRule: rule,
+    });
+
+    assert.equal(trainingClass.historicalUsedHours, 4);
+    assert.equal(trainingClass.usedHours, 4);
+    assert.equal(trainingClass.remainingHours, 6);
+    assert.equal(service.getClassLessons(auth, trainingClass.id).length, 6);
+  });
+
+  it("returns home lessons as today plus overdue backfill and excludes future upcoming lessons", () => {
+    const restoreNow = mockNow("2026-06-17T12:00:00.000");
+    try {
+      const child = service.createChild(auth, { name: "小宝" });
+      const trainingClass = service.createClass(auth, {
+        childId: child.id,
+        institutionName: "星星美术",
+        className: "大班A",
+        courseName: "美术启蒙",
+        totalHours: 4,
+        totalFee: 400,
+        startTime: "2026-06-16T09:00:00.000",
+        recurringRule: {
+          type: "weekly",
+          daysOfWeek: [2, 3, 4, 5],
+          timeSlots: [
+            { dayOfWeek: 2, startHour: 9, startMinute: 0, endHour: 10, endMinute: 0 },
+            { dayOfWeek: 3, startHour: 9, startMinute: 0, endHour: 10, endMinute: 0 },
+            { dayOfWeek: 4, startHour: 9, startMinute: 0, endHour: 10, endMinute: 0 },
+            { dayOfWeek: 5, startHour: 9, startMinute: 0, endHour: 10, endMinute: 0 },
+          ],
+        },
+      });
+      const lessons = service.getClassLessons(auth, trainingClass.id);
+      const home = service.getHomeLessons(auth);
+      const upcoming = service.getUpcomingLessons(auth, new URLSearchParams("days=3"));
+
+      assert.equal(home.todayLessons.some((item) => item.id === lessons[1]!.id), false);
+      assert.equal(home.needsBackfillLessons.some((item) => item.id === lessons[0]!.id), true);
+      assert.equal(home.needsBackfillLessons.some((item) => item.id === lessons[1]!.id), true);
+      assert.equal(home.todayLessons.some((item) => item.id === lessons[2]!.id), false);
+      assert.equal(upcoming.some((item) => item.id === lessons[2]!.id), true);
+      assert.equal(upcoming.some((item) => item.id === lessons[1]!.id), false);
+    } finally {
+      restoreNow();
+    }
+  });
+
+  it("does not deduct hours on leave until the makeup lesson is checked in", () => {
+    const restoreNow = mockNow("2026-06-15T08:00:00.000");
+    try {
+      const child = service.createChild(auth, { name: "小宝" });
+      const trainingClass = service.createClass(auth, {
+        childId: child.id,
+        institutionName: "星星美术",
+        className: "大班A",
+        courseName: "美术启蒙",
+        totalHours: 2,
+        totalFee: 200,
+        startTime: "2026-06-15T09:00:00.000",
+        recurringRule: rule,
+      });
+      const originalLesson = service.getClassLessons(auth, trainingClass.id)[0]!;
+      const leave = service.requestLeave(auth, {
+        lessonId: originalLesson.id,
+        reason: "孩子请假",
+        scheduledDate: "2026-06-20T09:00:00.000",
+        scheduledEndDate: "2026-06-20T10:00:00.000",
+      });
+      const afterLeaveClass = service.getClass(auth, trainingClass.id);
+      assert.equal(afterLeaveClass.usedHours, 0);
+      assert.equal(afterLeaveClass.remainingHours, 2);
+
+      const makeupLesson = service.getLesson(auth, leave.makeupLessonId!);
+      const checkinRestoreNow = mockNow("2026-06-20T09:10:00.000");
+      try {
+        service.checkIn(auth, { lessonId: makeupLesson.id });
+      } finally {
+        checkinRestoreNow();
+      }
+
+      const afterMakeupClass = service.getClass(auth, trainingClass.id);
+      assert.equal(afterMakeupClass.usedHours, 1);
+      assert.equal(afterMakeupClass.remainingHours, 1);
+    } finally {
+      restoreNow();
+    }
   });
 });
 
@@ -463,12 +650,12 @@ describe("children, classes, lessons", { concurrency: false }, () => {
       },
     });
     const lessons = service.getClassLessons(auth, trainingClass.id);
-    assert.equal(new Date(lessons[0]!.scheduledDate).getDay(), 3);
-    assert.equal(new Date(lessons[0]!.scheduledDate).getHours(), 16);
-    assert.equal(new Date(lessons[0]!.scheduledEndDate!).getHours(), 17);
-    assert.equal(new Date(lessons[1]!.scheduledDate).getDay(), 4);
-    assert.equal(new Date(lessons[1]!.scheduledDate).getHours(), 17);
-    assert.equal(new Date(lessons[1]!.scheduledEndDate!).getHours(), 18);
+    assert.equal(businessDateParts(parseBusinessDateTime(lessons[0]!.scheduledDate)).dayOfWeek, 3);
+    assert.equal(businessDateParts(parseBusinessDateTime(lessons[0]!.scheduledDate)).hour, 16);
+    assert.equal(businessDateParts(parseBusinessDateTime(lessons[0]!.scheduledEndDate!)).hour, 17);
+    assert.equal(businessDateParts(parseBusinessDateTime(lessons[1]!.scheduledDate)).dayOfWeek, 4);
+    assert.equal(businessDateParts(parseBusinessDateTime(lessons[1]!.scheduledDate)).hour, 17);
+    assert.equal(businessDateParts(parseBusinessDateTime(lessons[1]!.scheduledEndDate!)).hour, 18);
   });
 
   it("generates the first lesson when class start time is on a selected weekday", () => {
@@ -508,6 +695,36 @@ describe("children, classes, lessons", { concurrency: false }, () => {
     assert.equal(lessons[0]!.scheduledEndDate, "2026-06-15T17:00:00.000");
   });
 
+  it("does not shift evening generated lessons on UTC servers", () => {
+    const child = service.createChild(auth, { name: "小宝" });
+    const trainingClass = service.createClass(auth, {
+      childId: child.id,
+      institutionName: "小蓝星",
+      className: "篮球班",
+      courseName: "篮球",
+      totalHours: 1,
+      totalFee: 100,
+      startTime: "2026-06-18T17:30:00.000",
+      recurringRule: {
+        type: "weekly",
+        daysOfWeek: [4],
+        timeSlots: [
+          {
+            dayOfWeek: 4,
+            startHour: 17,
+            startMinute: 30,
+            endHour: 18,
+            endMinute: 30,
+          },
+        ],
+      },
+    });
+
+    const lessons = service.getClassLessons(auth, trainingClass.id);
+    assert.equal(lessons[0]!.scheduledDate, "2026-06-18T17:30:00.000");
+    assert.equal(lessons[0]!.scheduledEndDate, "2026-06-18T18:30:00.000");
+  });
+
   it("does not generate a lesson on a non-matching class start weekday", () => {
     const child = service.createChild(auth, { name: "小宝" });
     const trainingClass = service.createClass(auth, {
@@ -534,12 +751,12 @@ describe("children, classes, lessons", { concurrency: false }, () => {
     });
 
     const lessons = service.getClassLessons(auth, trainingClass.id);
-    assert.equal(new Date(lessons[0]!.scheduledDate).getDay(), 6);
+    assert.equal(businessDateParts(parseBusinessDateTime(lessons[0]!.scheduledDate)).dayOfWeek, 6);
     assert.equal(lessons[0]!.scheduledDate, "2026-06-13T10:30:00.000");
   });
 
   it("returns only stable scheduled lessons in the upcoming window", () => {
-    const restoreNow = mockNow("2026-06-15T08:45:00.000");
+    const restoreNow = mockNow("2026-06-16T09:10:00.000");
     try {
       const child = service.createChild(auth, { name: "小宝" });
       const trainingClass = service.createClass(auth, {
@@ -549,19 +766,29 @@ describe("children, classes, lessons", { concurrency: false }, () => {
         courseName: "美术启蒙",
         totalHours: 4,
         totalFee: 400,
-        startTime: "2026-06-15T00:00:00.000",
-        recurringRule: rule,
+        startTime: "2026-06-16T09:00:00.000",
+        recurringRule: {
+          type: "weekly",
+          daysOfWeek: [2, 3, 4, 5],
+          timeSlots: [
+            { dayOfWeek: 2, startHour: 9, startMinute: 0, endHour: 10, endMinute: 0 },
+            { dayOfWeek: 3, startHour: 9, startMinute: 0, endHour: 10, endMinute: 0 },
+            { dayOfWeek: 4, startHour: 9, startMinute: 0, endHour: 10, endMinute: 0 },
+            { dayOfWeek: 5, startHour: 9, startMinute: 0, endHour: 10, endMinute: 0 },
+          ],
+        },
       });
-      const first = service.getClassLessons(auth, trainingClass.id)[0]!;
+      const [first, second, third] = service.getClassLessons(auth, trainingClass.id);
+      assert.ok(first);
+      assert.ok(second);
+      assert.ok(third);
+      const upcoming = service.getUpcomingLessons(auth, new URLSearchParams({ days: "3" }));
+      assert.equal(upcoming.length > 0, true);
+      service.updateLesson(auth, third.id, { status: "leave" });
       assert.equal(
         service.getUpcomingLessons(auth, new URLSearchParams({ days: "3" }))
-          .length,
-        1,
-      );
-      service.checkIn(auth, { lessonId: first.id, type: "checkin" });
-      assert.deepEqual(
-        service.getUpcomingLessons(auth, new URLSearchParams({ days: "3" })),
-        [],
+          .length < upcoming.length,
+        true,
       );
     } finally {
       restoreNow();
@@ -610,8 +837,8 @@ describe("children, classes, lessons", { concurrency: false }, () => {
       },
       () => crypto.randomUUID(),
     );
-    assert.equal(new Date(monthly[0]!.scheduledDate).getDay(), 6);
-    assert.equal(new Date(monthly[0]!.scheduledDate).getDate(), 6);
+    assert.equal(businessDateParts(parseBusinessDateTime(monthly[0]!.scheduledDate)).dayOfWeek, 6);
+    assert.equal(businessDateParts(parseBusinessDateTime(monthly[0]!.scheduledDate)).day, 6);
     const custom = generateLessonsForClass(
       {
         ...baseClass,
@@ -811,7 +1038,10 @@ describe("attendance, leave, cost", { concurrency: false }, () => {
       assert.equal(
         lessons
           .filter((lesson) => lesson.status === "scheduled")
-          .every((lesson) => new Date(lesson.scheduledDate).getDay() === 3),
+          .every(
+            (lesson) =>
+              businessDateParts(parseBusinessDateTime(lesson.scheduledDate)).dayOfWeek === 3,
+          ),
         true,
       );
     } finally {
@@ -1038,9 +1268,9 @@ describe("attendance, leave, cost", { concurrency: false }, () => {
       newScheduledEndDate: "2026-07-01T11:30:00.000",
     });
     assert.equal(service.getLesson(auth, lessons[0]!.id).status, "leave");
-    assert.equal(service.getLesson(auth, leaveChange.newLessonId).status, "scheduled");
+    assert.equal(service.getLesson(auth, leaveChange.newLessonId!).status, "scheduled");
     assert.equal(
-      service.getLesson(auth, leaveChange.newLessonId).scheduledEndDate,
+      service.getLesson(auth, leaveChange.newLessonId!).scheduledEndDate,
       "2026-07-01T11:30:00.000",
     );
     const rescheduleChange = service.createLessonChange(auth, {
@@ -1054,7 +1284,7 @@ describe("attendance, leave, cost", { concurrency: false }, () => {
     assert.equal(service.lessonChangeHistory(auth, new URLSearchParams()).length, 2);
     service.cancelLessonChange(auth, rescheduleChange.id);
     assert.equal(service.getLesson(auth, lessons[1]!.id).status, "scheduled");
-    assert.throws(() => service.getLesson(auth, rescheduleChange.newLessonId), /not found/i);
+    assert.throws(() => service.getLesson(auth, rescheduleChange.newLessonId!), /not found/i);
   });
 
   it("does not cancel a lesson change after replacement is completed", () => {

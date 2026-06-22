@@ -1,4 +1,4 @@
-const BUSINESS_TIMEZONE_OFFSET_MINUTES = 8 * 60;
+export const BUSINESS_TIMEZONE_OFFSET_MINUTES = 8 * 60;
 const LOCAL_DATE_TIME_RE =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/;
 
@@ -62,4 +62,74 @@ export function normalizeDateString(value: string) {
 
 export function businessTimestamp(value: string | Date) {
   return (typeof value === "string" ? parseBusinessDateTime(value) : value).getTime();
+}
+
+export function businessDateParts(date: Date) {
+  const shifted = new Date(date.getTime() + BUSINESS_TIMEZONE_OFFSET_MINUTES * 60_000);
+  return {
+    year: shifted.getUTCFullYear(),
+    month: shifted.getUTCMonth(),
+    day: shifted.getUTCDate(),
+    hour: shifted.getUTCHours(),
+    minute: shifted.getUTCMinutes(),
+    second: shifted.getUTCSeconds(),
+    millisecond: shifted.getUTCMilliseconds(),
+    dayOfWeek: shifted.getUTCDay(),
+  };
+}
+
+export function businessDateFromParts(
+  year: number,
+  month: number,
+  day: number,
+  hour = 0,
+  minute = 0,
+  second = 0,
+  millisecond = 0,
+) {
+  return new Date(
+    Date.UTC(year, month, day, hour, minute, second, millisecond) -
+      BUSINESS_TIMEZONE_OFFSET_MINUTES * 60_000,
+  );
+}
+
+export function businessStartOfDay(date = new Date()) {
+  const parts = businessDateParts(date);
+  return businessDateFromParts(parts.year, parts.month, parts.day);
+}
+
+export function businessEndOfDay(date = new Date()) {
+  const parts = businessDateParts(date);
+  return businessDateFromParts(parts.year, parts.month, parts.day, 23, 59, 59, 999);
+}
+
+export function businessAddDays(date: Date, days: number) {
+  const parts = businessDateParts(date);
+  return businessDateFromParts(
+    parts.year,
+    parts.month,
+    parts.day + days,
+    parts.hour,
+    parts.minute,
+    parts.second,
+    parts.millisecond,
+  );
+}
+
+export function businessAddMonths(date: Date, months: number) {
+  const parts = businessDateParts(date);
+  return businessDateFromParts(
+    parts.year,
+    parts.month + months,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second,
+    parts.millisecond,
+  );
+}
+
+export function businessMonthStart(date = new Date()) {
+  const parts = businessDateParts(date);
+  return businessDateFromParts(parts.year, parts.month, 1);
 }

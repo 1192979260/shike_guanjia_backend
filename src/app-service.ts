@@ -8,6 +8,12 @@ import { lookup as dnsLookup } from "node:dns";
 import { request as httpsRequest } from "node:https";
 import type { Config } from "./config.js";
 import {
+  businessAddDays,
+  businessAddMonths,
+  businessDateParts,
+  businessEndOfDay,
+  businessMonthStart,
+  businessStartOfDay,
   businessTimestamp,
   nowLocalIso,
   parseBusinessDateTime,
@@ -29,9 +35,11 @@ import type {
   FamilyMember,
   LeaveRecord,
   Lesson,
+  LessonAttendanceStatus,
   LessonChangeRecord,
   LessonChangeSource,
   LessonChangeType,
+  LessonHomePayload,
   LessonReminderSubscription,
   MonthlyCostStatistics,
   ReminderSettings,
@@ -57,6 +65,7 @@ import {
 const CHECKIN_EARLY_WINDOW_MS = 15 * 60 * 1000;
 const CHECKIN_LATE_WINDOW_MS = 2 * 60 * 60 * 1000;
 const BACKDATED_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const UPCOMING_DEFAULT_DAYS = 3;
 
 let cachedWechatAccessToken:
   | { token: string; expiresAt: number }
@@ -80,6 +89,25 @@ interface JsonRequestOptions {
 export interface AuthContext {
   user: User;
   familyId: string;
+}
+
+export function buildLessonReminderTemplateData(
+  subscription: LessonReminderSubscription,
+  lesson: Lesson,
+  trainingClass: TrainingClass,
+  childName?: string | null,
+) {
+  const courseName = truncateTemplateValue(
+    trainingClass.courseName || trainingClass.className || "课程提醒",
+    20,
+  );
+  const studentName = truncateTemplateValue(childName || "学员", 20);
+
+  return {
+    thing9: { value: studentName },
+    thing8: { value: courseName },
+    time15: { value: formatTemplateDateTime(lesson.scheduledDate) },
+  };
 }
 
 export class AppService {
@@ -322,6 +350,12 @@ export class AppService {
     const advanceMinutes =
       optionalReminderAdvanceMinutes(body.advanceMinutes) ??
       settings.advanceMinutes;
+    const user = this.store.users.get(ctx.user.id) ?? ctx.user;
+    if (!user.wechatOpenid) {
+      throw businessError("WECHAT_OPENID_MISSING", "请先完成微信身份绑定再订阅提醒", [
+        { field: "openid", message: "当前账号尚未绑定微信 openid" },
+      ]);
+    }
     const lesson = this.requireLesson(ctx, lessonIds[0]!);
     if (lesson.status !== "scheduled") {
       throw badRequest("Only scheduled lessons can be subscribed", [
@@ -509,12 +543,21 @@ export class AppService {
     const childId = assertString(body.childId, "childId");
     this.requireChild(ctx, childId);
     const totalHours = Number(body.totalHours);
-    const usedHours = body.usedHours === undefined ? 0 : Number(body.usedHours);
+    const historicalUsedHours =
+      body.historicalUsedHours === undefined
+        ? body.usedHours === undefined
+          ? 0
+          : Number(body.usedHours)
+        : Number(body.historicalUsedHours);
     const totalFee = Number(body.totalFee);
     if (!Number.isInteger(totalHours) || totalHours <= 0)
       throw badRequest("totalHours must be positive");
-    if (!Number.isInteger(usedHours) || usedHours < 0 || usedHours > totalHours)
-      throw badRequest("usedHours must be between 0 and totalHours");
+    if (
+      !Number.isInteger(historicalUsedHours) ||
+      historicalUsedHours < 0 ||
+      historicalUsedHours > totalHours
+    )
+      throw badRequest("historicalUsedHours must be between 0 and totalHours");
     if (!Number.isFinite(totalFee) || totalFee < 0)
       throw badRequest("totalFee must be non-negative");
     const startTime = toLocalIso(assertIsoDate(body.startTime, "startTime"));
@@ -536,8 +579,9 @@ export class AppService {
       teacherName: optionalString(body.teacherName) ?? null,
       teacherPhone: optionalString(body.teacherPhone) ?? null,
       totalHours,
-      usedHours,
-      remainingHours: Math.max(0, totalHours - usedHours),
+      historicalUsedHours,
+      usedHours: historicalUsedHours,
+      remainingHours: Math.max(0, totalHours - historicalUsedHours),
       totalFee,
       startTime,
       endTime,
@@ -584,6 +628,10 @@ export class AppService {
         body.totalHours === undefined
           ? current.totalHours
           : Number(body.totalHours),
+      historicalUsedHours:
+        body.historicalUsedHours === undefined
+          ? current.historicalUsedHours ?? current.usedHours
+          : Number(body.historicalUsedHours),
       usedHours:
         body.usedHours === undefined
           ? current.usedHours
@@ -620,6 +668,19 @@ export class AppService {
       updated.usedHours > updated.totalHours
     )
       throw badRequest("usedHours must be between 0 and totalHours");
+    if (
+      !Number.isInteger(updated.historicalUsedHours ?? 0) ||
+      (updated.historicalUsedHours ?? 0) < 0 ||
+      (updated.historicalUsedHours ?? 0) > updated.totalHours
+    )
+      throw badRequest("historicalUsedHours must be between 0 and totalHours");
+    const completedLessons = [...this.store.lessons.values()].filter(
+      (lesson) => lesson.classId === classId && this.lessonAttendanceStatus(lesson) === "checked_in",
+    ).length;
+    updated.usedHours = Math.max(
+      completedLessons + (updated.historicalUsedHours ?? 0),
+      updated.usedHours,
+    );
     updated.remainingHours = Math.max(
       0,
       updated.totalHours - updated.usedHours,
@@ -663,12 +724,23 @@ export class AppService {
 
   renewClass(ctx: AuthContext, classId: string, body: Record<string, unknown>) {
     const original = this.requireClass(ctx, classId);
-    return this.createClass(ctx, {
+    const additionalHours = Number(body.newTotalHours);
+    const additionalFee = Number(body.newTotalFee);
+    if (!Number.isInteger(additionalHours) || additionalHours <= 0)
+      throw badRequest("newTotalHours must be positive");
+    if (!Number.isFinite(additionalFee) || additionalFee < 0)
+      throw badRequest("newTotalFee must be non-negative");
+    const updated: TrainingClass = {
       ...original,
-      totalHours: body.newTotalHours,
-      totalFee: body.newTotalFee,
-      startTime: nowIso(),
-    });
+      totalHours: original.totalHours + additionalHours,
+      totalFee: original.totalFee + additionalFee,
+      remainingHours: original.remainingHours + additionalHours,
+      updatedAt: nowIso(),
+      status: "active",
+    };
+    this.store.classes.set(updated.id, updated);
+    this.regenerateFutureLessons(updated);
+    return updated;
   }
 
   deleteClass(ctx: AuthContext, classId: string) {
@@ -721,11 +793,9 @@ export class AppService {
   }
 
   getUpcomingLessons(ctx: AuthContext, query: URLSearchParams) {
-    const days = Math.max(1, Math.min(30, Number(query.get("days") ?? 3)));
-    const start = new Date();
-    const end = new Date(start);
-    end.setDate(end.getDate() + days - 1);
-    end.setHours(23, 59, 59, 999);
+    const days = Math.max(1, Math.min(30, Number(query.get("days") ?? UPCOMING_DEFAULT_DAYS)));
+    const start = businessAddDays(businessStartOfDay(), 1);
+    const end = businessEndOfDay(businessAddDays(start, days - 1));
 
     const childId = query.get("childId");
     const classId = query.get("classId");
@@ -734,7 +804,7 @@ export class AppService {
         const trainingClass = this.store.classes.get(lesson.classId);
         const date = parseBusinessDateTime(lesson.scheduledDate);
         return (
-          lesson.status === "scheduled" &&
+          this.isLessonActionable(lesson) &&
           date >= start &&
           date <= end &&
           (!childId || trainingClass?.childId === childId) &&
@@ -743,6 +813,29 @@ export class AppService {
         );
       })
       .sort(byScheduledDate);
+  }
+
+  getHomeLessons(ctx: AuthContext): LessonHomePayload {
+    const todayStart = businessStartOfDay();
+    const tomorrowStart = businessAddDays(todayStart, 1);
+    const now = Date.now();
+    const lessons = this.familyLessons(ctx).filter((lesson) => !this.isSuspended(lesson));
+    return {
+      todayLessons: lessons
+        .filter((lesson) => {
+          const lessonTime = businessTimestamp(lesson.scheduledDate);
+          return (
+            lessonTime >= todayStart.getTime() &&
+            lessonTime < tomorrowStart.getTime() &&
+            this.isLessonActionable(lesson) &&
+            !this.needsBackfill(lesson, now)
+          );
+        })
+        .sort(byScheduledDate),
+      needsBackfillLessons: lessons
+        .filter((lesson) => this.needsBackfill(lesson, now))
+        .sort(byScheduledDate),
+    };
   }
 
   getLesson(ctx: AuthContext, lessonId: string) {
@@ -772,12 +865,17 @@ export class AppService {
       scheduledDate: toLocalIso(scheduledDate),
       scheduledEndDate: toLocalIso(scheduledEndDate),
       status: "scheduled",
+      sourceType: "manual_makeup",
+      attendanceStatus: "pending",
+      changeStatus: "normal",
       actualDate: null,
       checkinTime: null,
-      isMakeup: false,
+      isMakeup: true,
       notes: null,
       leaveReason: null,
       isManual: true,
+      originLessonId: optionalString(body.originLessonId) ?? null,
+      changeBatchId: optionalString(body.changeBatchId) ?? null,
     };
     this.store.lessons.set(lesson.id, lesson);
     return lesson;
@@ -826,19 +924,41 @@ export class AppService {
       throw badRequest("scheduledEndDate must be after scheduledDate", [
         { field: "scheduledEndDate", message: "结束时间必须晚于开始时间" },
       ]);
+    const nextStatus =
+      body.status === undefined
+        ? lesson.status
+        : assertLessonStatus(body.status);
     const updated: Lesson = {
       ...lesson,
       scheduledDate: toLocalIso(scheduledDate),
       scheduledEndDate: scheduledEndDate ? toLocalIso(scheduledEndDate) : null,
-      status:
-        body.status === undefined
-          ? lesson.status
-          : assertLessonStatus(body.status),
+      status: nextStatus,
+      attendanceStatus:
+        body.attendanceStatus === undefined
+          ? this.lessonAttendanceStatus(lesson)
+          : assertLessonAttendanceStatus(body.attendanceStatus),
+      changeStatus:
+        body.changeStatus === undefined
+          ? deriveLessonChangeStatusFromStatus(nextStatus)
+          : assertLessonChangeStatus(body.changeStatus),
       notes:
         body.notes === undefined
           ? lesson.notes
           : (optionalString(body.notes) ?? null),
+      sourceType:
+        body.sourceType === undefined
+          ? lesson.sourceType ?? (lesson.isMakeup ? "manual_makeup" : "generated")
+          : assertLessonSourceType(body.sourceType),
+      originLessonId:
+        body.originLessonId === undefined
+          ? lesson.originLessonId ?? null
+          : (optionalString(body.originLessonId) ?? null),
+      changeBatchId:
+        body.changeBatchId === undefined
+          ? lesson.changeBatchId ?? null
+          : (optionalString(body.changeBatchId) ?? null),
     };
+    if (updated.status === "completed") updated.attendanceStatus = "checked_in";
     this.store.lessons.set(lesson.id, updated);
     return updated;
   }
@@ -907,11 +1027,11 @@ export class AppService {
       (item) => item.lessonId === lesson.id,
     );
     if (existing) return existing;
-    if (lesson.status === "leave")
+    if (this.lessonChangeStatus(lesson) === "leave")
       throw badRequest("Cannot check in a leave lesson");
-    if (lesson.status === "rescheduled")
+    if (this.lessonChangeStatus(lesson) === "rescheduled")
       throw badRequest("Cannot check in a rescheduled lesson");
-    if (lesson.status === "cancelled")
+    if (this.lessonChangeStatus(lesson) === "cancelled")
       throw badRequest("Cannot check in a cancelled lesson");
     const type = body.type === "backdated" ? "backdated" : "checkin";
     const now = new Date();
@@ -1004,6 +1124,7 @@ export class AppService {
     this.store.lessons.set(lesson.id, {
       ...lesson,
       status: "completed",
+      attendanceStatus: "checked_in",
       actualDate: checkinTime,
       checkinTime,
       notes: attendance.notes,
@@ -1030,10 +1151,11 @@ export class AppService {
     this.store.lessons.set(lesson.id, {
       ...lesson,
       status: "scheduled",
+      attendanceStatus: this.needsBackfill(lesson) ? "missed_needs_makeup_checkin" : "pending",
       actualDate: null,
       checkinTime: null,
     });
-    this.revertClassUsage(lesson.classId);
+    this.refreshClassUsage(lesson.classId);
     return { success: true, lesson: this.requireLesson(ctx, lesson.id) };
   }
 
@@ -1069,7 +1191,7 @@ export class AppService {
         (lesson) =>
           businessTimestamp(lesson.scheduledDate) < Date.now() &&
           businessTimestamp(lesson.scheduledDate) >= since &&
-          lesson.status === "scheduled" &&
+          this.isLessonActionable(lesson) &&
           ![...this.store.attendance.values()].some(
             (item) => item.lessonId === lesson.id,
           ),
@@ -1096,11 +1218,11 @@ export class AppService {
       ctx,
       assertString(body.lessonId, "lessonId"),
     );
-    if (lesson.status !== "scheduled")
+    if (!this.isLessonActionable(lesson))
       throw badRequest("Only scheduled lessons can be changed");
     const trainingClass = this.requireClass(ctx, lesson.classId);
     const type = assertLessonChangeType(body.type);
-    const source = assertLessonChangeSource(body.source);
+    const source = body.source === undefined ? "other" : assertLessonChangeSource(body.source);
     const newStart = assertIsoDate(body.newScheduledDate, "newScheduledDate");
     const requestedNewEnd =
       body.newScheduledEndDate === undefined || body.newScheduledEndDate === null
@@ -1131,11 +1253,16 @@ export class AppService {
       scheduledDate: toLocalIso(newStart),
       scheduledEndDate: toLocalIso(newEnd),
       status: "scheduled",
+      sourceType: type === "leave" ? "manual_makeup" : "generated",
+      attendanceStatus: "pending",
+      changeStatus: "normal",
       actualDate: null,
       checkinTime: null,
-      isMakeup: true,
+      isMakeup: type === "leave",
       leaveReason: null,
-      isManual: false,
+      isManual: type === "leave",
+      originLessonId: lesson.id,
+      changeBatchId: null,
     };
     const change: LessonChangeRecord = {
       id: this.store.id(),
@@ -1145,8 +1272,13 @@ export class AppService {
       type,
       source,
       reason: optionalString(body.reason) ?? null,
+      description: optionalString(body.description) ?? null,
       originalStartAt: lesson.scheduledDate,
       originalEndAt: lesson.scheduledEndDate ?? null,
+      newScheduledDate: newLesson.scheduledDate,
+      newScheduledEndDate: newLesson.scheduledEndDate ?? null,
+      replacementLessonId: type === "reschedule" ? newLesson.id : null,
+      makeupLessonId: type === "leave" ? newLesson.id : null,
       newLessonId: newLesson.id,
       status: "active",
       createdAt: nowIso(),
@@ -1155,6 +1287,8 @@ export class AppService {
     this.store.lessons.set(lesson.id, {
       ...lesson,
       status: type === "leave" ? "leave" : "rescheduled",
+      attendanceStatus: "pending",
+      changeStatus: type === "leave" ? "leave" : "rescheduled",
       leaveReason: change.reason,
     });
     this.store.lessons.set(newLesson.id, newLesson);
@@ -1163,7 +1297,9 @@ export class AppService {
 
   cancelLessonChange(ctx: AuthContext, changeId: string) {
     const change = this.requireLessonChange(ctx, changeId);
-    const newLesson = this.store.lessons.get(change.newLessonId);
+    const linkedLessonId =
+      change.replacementLessonId ?? change.makeupLessonId ?? change.newLessonId;
+    const newLesson = linkedLessonId ? this.store.lessons.get(linkedLessonId) : undefined;
     if (newLesson?.status === "completed")
       throw badRequest("Cannot cancel change after replacement lesson is completed");
     this.store.lessonChanges.set(change.id, { ...change, status: "cancelled" });
@@ -1172,14 +1308,16 @@ export class AppService {
       this.store.lessons.set(original.id, {
         ...original,
         status: "scheduled",
+        changeStatus: "normal",
         leaveReason: null,
       });
-    this.store.lessons.delete(change.newLessonId);
+    if (linkedLessonId) this.store.lessons.delete(linkedLessonId);
     return { success: true };
   }
 
   lessonChangeHistory(ctx: AuthContext, query: URLSearchParams) {
     const childId = query.get("childId");
+    const classId = query.get("classId");
     const start = query.get("startDate")
       ? parseBusinessDateTime(query.get("startDate") as string, "startDate")
       : null;
@@ -1192,6 +1330,7 @@ export class AppService {
         return (
           this.canAccessClass(ctx, change.classId) &&
           (!childId || change.childId === childId) &&
+          (!classId || change.classId === classId) &&
           (!start || date >= start) &&
           (!end || date <= end)
         );
@@ -1216,14 +1355,49 @@ export class AppService {
     );
     if (lesson.status === "completed")
       throw badRequest("Cannot request leave for completed lesson");
+    if (!this.isLessonActionable(lesson))
+      throw badRequest("Only actionable lessons can request leave");
     const trainingClass = this.requireClass(ctx, lesson.classId);
-    const makeup = nextLessonAfter(
-      trainingClass,
-      parseBusinessDateTime(lesson.scheduledDate, "scheduledDate"),
-      () => this.store.id(),
-    );
+    const requestedStart = body.scheduledDate
+      ? assertIsoDate(body.scheduledDate, "scheduledDate")
+      : null;
+    const requestedEnd = body.scheduledEndDate
+      ? assertIsoDate(body.scheduledEndDate, "scheduledEndDate")
+      : null;
+    const makeup = requestedStart
+      ? {
+          ...lesson,
+          id: this.store.id(),
+          scheduledDate: toLocalIso(requestedStart),
+          scheduledEndDate: toLocalIso(
+            requestedEnd ??
+              inferLessonEndDate(trainingClass, requestedStart) ??
+              new Date(requestedStart.getTime() + 60 * 60 * 1000),
+          ),
+          status: "scheduled" as const,
+          sourceType: "manual_makeup" as const,
+          attendanceStatus: "pending" as const,
+          changeStatus: "normal" as const,
+          actualDate: null,
+          checkinTime: null,
+          isMakeup: true,
+          notes: null,
+          leaveReason: null,
+          isManual: true,
+          originLessonId: lesson.id,
+          changeBatchId: null,
+        }
+      : nextLessonAfter(
+          trainingClass,
+          parseBusinessDateTime(lesson.scheduledDate, "scheduledDate"),
+          () => this.store.id(),
+        );
     if (makeup) {
       makeup.isMakeup = true;
+      makeup.sourceType = "manual_makeup";
+      makeup.attendanceStatus = "pending";
+      makeup.changeStatus = "normal";
+      makeup.originLessonId = lesson.id;
       this.store.lessons.set(makeup.id, makeup);
     }
     const leave: LeaveRecord = {
@@ -1241,7 +1415,28 @@ export class AppService {
     this.store.lessons.set(lesson.id, {
       ...lesson,
       status: "leave",
+      changeStatus: "leave",
       leaveReason: leave.reason,
+    });
+    const changeId = this.store.id();
+    this.store.lessonChanges.set(changeId, {
+      id: changeId,
+      lessonId: lesson.id,
+      classId: trainingClass.id,
+      childId: trainingClass.childId,
+      type: "leave",
+      source: "student",
+      reason: leave.reason,
+      description: null,
+      originalStartAt: lesson.scheduledDate,
+      originalEndAt: lesson.scheduledEndDate ?? null,
+      newScheduledDate: makeup?.scheduledDate ?? null,
+      newScheduledEndDate: makeup?.scheduledEndDate ?? null,
+      makeupLessonId: makeup?.id ?? null,
+      replacementLessonId: null,
+      newLessonId: makeup?.id ?? null,
+      status: "active",
+      createdAt: nowIso(),
     });
     return leave;
   }
@@ -1260,6 +1455,7 @@ export class AppService {
       this.store.lessons.set(lesson.id, {
         ...lesson,
         status: "scheduled",
+        changeStatus: "normal",
         leaveReason: null,
       });
     if (leave.makeupLessonId) this.store.lessons.delete(leave.makeupLessonId);
@@ -1397,13 +1593,12 @@ export class AppService {
   costTrend(ctx: AuthContext, query: URLSearchParams): CostTrendPoint[] {
     const months = Math.max(1, Math.min(24, Number(query.get("months") ?? 6)));
     const result: CostTrendPoint[] = [];
-    const date = new Date();
-    date.setDate(1);
+    const date = businessMonthStart();
     for (let index = months - 1; index >= 0; index -= 1) {
-      const cursor = new Date(date);
-      cursor.setMonth(cursor.getMonth() - index);
-      const year = cursor.getFullYear();
-      const month = cursor.getMonth() + 1;
+      const cursor = businessAddMonths(date, -index);
+      const parts = businessDateParts(cursor);
+      const year = parts.year;
+      const month = parts.month + 1;
       const params = new URLSearchParams({
         year: String(year),
         month: String(month),
@@ -1521,6 +1716,58 @@ export class AppService {
     );
   }
 
+  private lessonAttendanceStatus(lesson: Lesson): LessonAttendanceStatus {
+    if (lesson.attendanceStatus) return lesson.attendanceStatus;
+    if (lesson.status === "completed" || lesson.checkinTime || lesson.actualDate)
+      return "checked_in";
+    if (
+      this.lessonChangeStatus(lesson) === "leave" ||
+      this.lessonChangeStatus(lesson) === "cancelled"
+    )
+      return "pending";
+    return this.needsBackfill(lesson) ? "missed_needs_makeup_checkin" : "pending";
+  }
+
+  private lessonChangeStatus(lesson: Lesson) {
+    if (lesson.changeStatus) return lesson.changeStatus;
+    if (lesson.status === "leave") return "leave" as const;
+    if (lesson.status === "rescheduled") return "rescheduled" as const;
+    if (lesson.status === "cancelled") return "cancelled" as const;
+    return "normal" as const;
+  }
+
+  private isLessonActionable(lesson: Lesson) {
+    return (
+      this.lessonAttendanceStatus(lesson) !== "checked_in" &&
+      this.lessonChangeStatus(lesson) !== "leave" &&
+      this.lessonChangeStatus(lesson) !== "cancelled"
+    );
+  }
+
+  private needsBackfill(lesson: Lesson, now = Date.now()) {
+    const changeStatus = this.lessonChangeStatus(lesson);
+    const isCheckedIn =
+      lesson.attendanceStatus === "checked_in" ||
+      lesson.status === "completed" ||
+      Boolean(lesson.checkinTime) ||
+      Boolean(lesson.actualDate);
+    return (
+      !isCheckedIn &&
+      changeStatus !== "leave" &&
+      changeStatus !== "cancelled" &&
+      businessTimestamp(lesson.scheduledEndDate ?? lesson.scheduledDate) < now
+    );
+  }
+
+  private isGeneratedFutureLesson(lesson: Lesson) {
+    return (
+      lesson.status === "scheduled" &&
+      lesson.isManual !== true &&
+      lesson.isMakeup !== true &&
+      (lesson.sourceType ?? "generated") === "generated"
+    );
+  }
+
   private monthLessons(
     ctx: AuthContext,
     year: number,
@@ -1530,10 +1777,11 @@ export class AppService {
   ) {
     return this.familyLessons(ctx).filter((lesson) => {
       const date = parseBusinessDateTime(lesson.scheduledDate);
+      const parts = businessDateParts(date);
       const trainingClass = this.store.classes.get(lesson.classId);
       return (
-        date.getFullYear() === year &&
-        date.getMonth() + 1 === month &&
+        parts.year === year &&
+        parts.month + 1 === month &&
         (!childId || trainingClass?.childId === childId) &&
         (!classId || lesson.classId === classId)
       );
@@ -1541,23 +1789,29 @@ export class AppService {
   }
 
   private regenerateFutureLessons(trainingClass: TrainingClass) {
-    const preserved = [...this.store.lessons.values()].filter(
-      (lesson) =>
-        lesson.classId === trainingClass.id &&
-        (lesson.status !== "scheduled" || lesson.isManual || lesson.isMakeup),
-    );
+    const now = Date.now();
+    const changeBatchId = this.store.id();
+    const preserved = [...this.store.lessons.values()].filter((lesson) => {
+      if (lesson.classId !== trainingClass.id) return false;
+      const lessonEnd = businessTimestamp(
+        lesson.scheduledEndDate ?? lesson.scheduledDate,
+      );
+      return (
+        lessonEnd < now ||
+        !this.isGeneratedFutureLesson(lesson) ||
+        this.lessonAttendanceStatus(lesson) === "checked_in"
+      );
+    });
     for (const lesson of [...this.store.lessons.values()].filter(
       (item) =>
         item.classId === trainingClass.id &&
-        item.status === "scheduled" &&
-        !item.isManual &&
-        !item.isMakeup,
+        this.isGeneratedFutureLesson(item),
     ))
       this.store.lessons.delete(lesson.id);
     const generatedCount = Math.max(
       0,
-      trainingClass.totalHours -
-        preserved.filter(countsTowardClassHours).length,
+      trainingClass.remainingHours -
+        preserved.filter((lesson) => this.lessonAttendanceStatus(lesson) !== "checked_in" && countsTowardClassHours(lesson)).length,
     );
     const latestCompletedDate = preserved
       .filter((lesson) => lesson.status === "completed")
@@ -1589,16 +1843,20 @@ export class AppService {
           ),
       )
       .slice(0, generatedCount);
-    for (const lesson of generated) this.store.lessons.set(lesson.id, lesson);
+    for (const lesson of generated)
+      this.store.lessons.set(lesson.id, {
+        ...lesson,
+        sourceType: "generated",
+        attendanceStatus: "pending",
+        changeStatus: "normal",
+        changeBatchId,
+      });
   }
 
   private refreshClassUsage(classId: string) {
     const trainingClass = this.store.classes.get(classId);
     if (!trainingClass) return;
-    const usedHours = Math.max(
-      trainingClass.usedHours,
-      this.countUsedHours(classId),
-    );
+    const usedHours = this.countUsedHours(classId);
     this.store.classes.set(classId, {
       ...trainingClass,
       usedHours,
@@ -1610,25 +1868,20 @@ export class AppService {
   }
 
   private revertClassUsage(classId: string) {
-    const trainingClass = this.store.classes.get(classId);
-    if (!trainingClass) return;
-    const usedHours = Math.max(0, trainingClass.usedHours - 1);
-    this.store.classes.set(classId, {
-      ...trainingClass,
-      usedHours,
-      remainingHours: Math.max(0, trainingClass.totalHours - usedHours),
-      status:
-        trainingClass.status === "ended" && usedHours < trainingClass.totalHours
-          ? "active"
-          : trainingClass.status,
-      updatedAt: nowIso(),
-    });
+    this.refreshClassUsage(classId);
   }
 
   private countUsedHours(classId: string) {
-    return [...this.store.lessons.values()].filter(
-      (lesson) => lesson.classId === classId && lesson.status === "completed",
-    ).length;
+    const trainingClass = this.store.classes.get(classId);
+    if (!trainingClass) return 0;
+    return (
+      (trainingClass.historicalUsedHours ?? 0) +
+      [...this.store.lessons.values()].filter(
+        (lesson) =>
+          lesson.classId === classId &&
+          this.lessonAttendanceStatus(lesson) === "checked_in",
+      ).length
+    );
   }
 
   private isSuspended(lesson: Lesson) {
@@ -1699,13 +1952,12 @@ export class AppService {
           touser: openid,
           template_id: subscription.templateId,
           page: subscription.page ?? `/pages/class-detail/index?classId=${trainingClass.id}`,
-          data: {
-            thing1: { value: truncateTemplateValue(trainingClass.courseName || trainingClass.className, 20) },
-            time2: { value: formatTemplateDateTime(lesson.scheduledDate) },
-            thing3: { value: truncateTemplateValue(trainingClass.institutionName || "上课地点待确认", 20) },
-            thing4: { value: truncateTemplateValue(child?.name ?? "学员", 20) },
-            thing5: { value: truncateTemplateValue(`请提前${subscription.advanceMinutes}分钟准备`, 20) },
-          },
+          data: buildLessonReminderTemplateData(
+            subscription,
+            lesson,
+            trainingClass,
+            child?.name,
+          ),
         },
       },
     );
@@ -1803,11 +2055,12 @@ function truncateTemplateValue(value: string, maxLength: number) {
 
 function formatTemplateDateTime(value: string) {
   const date = parseBusinessDateTime(value);
-  const month = `${date.getMonth() + 1}`.padStart(2, "0");
-  const day = `${date.getDate()}`.padStart(2, "0");
-  const hour = `${date.getHours()}`.padStart(2, "0");
-  const minute = `${date.getMinutes()}`.padStart(2, "0");
-  return `${date.getFullYear()}年${month}月${day}日 ${hour}:${minute}`;
+  const parts = businessDateParts(date);
+  const month = `${parts.month + 1}`.padStart(2, "0");
+  const day = `${parts.day}`.padStart(2, "0");
+  const hour = `${parts.hour}`.padStart(2, "0");
+  const minute = `${parts.minute}`.padStart(2, "0");
+  return `${parts.year}年${month}月${day}日 ${hour}:${minute}`;
 }
 
 function requestJson<T>(
@@ -1885,9 +2138,10 @@ function countsTowardClassHours(lesson: Lesson) {
 }
 
 function inferLessonEndDate(trainingClass: TrainingClass, scheduledDate: Date) {
+  const { dayOfWeek } = businessDateParts(scheduledDate);
   const slot =
     trainingClass.recurringRule.timeSlots.find(
-      (item) => item.dayOfWeek === scheduledDate.getDay(),
+      (item) => item.dayOfWeek === dayOfWeek,
     ) ?? trainingClass.recurringRule.timeSlots[0];
   if (!slot) return null;
   const durationMinutes =
@@ -1956,10 +2210,44 @@ function assertLessonStatus(value: unknown): Lesson["status"] {
     value === "scheduled" ||
     value === "completed" ||
     value === "leave" ||
+    value === "rescheduled" ||
     value === "cancelled"
   )
     return value;
   throw badRequest("Invalid lesson status");
+}
+
+function assertLessonAttendanceStatus(value: unknown): Lesson["attendanceStatus"] {
+  if (
+    value === "pending" ||
+    value === "checked_in" ||
+    value === "missed_needs_makeup_checkin"
+  )
+    return value;
+  throw badRequest("Invalid lesson attendance status");
+}
+
+function assertLessonChangeStatus(value: unknown): Lesson["changeStatus"] {
+  if (
+    value === "normal" ||
+    value === "leave" ||
+    value === "rescheduled" ||
+    value === "cancelled"
+  )
+    return value;
+  throw badRequest("Invalid lesson change status");
+}
+
+function assertLessonSourceType(value: unknown): Lesson["sourceType"] {
+  if (value === "generated" || value === "manual_makeup") return value;
+  throw badRequest("Invalid lesson source type");
+}
+
+function deriveLessonChangeStatusFromStatus(status: Lesson["status"]): Lesson["changeStatus"] {
+  if (status === "leave") return "leave";
+  if (status === "rescheduled") return "rescheduled";
+  if (status === "cancelled") return "cancelled";
+  return "normal";
 }
 
 function csvEscape(value: string) {

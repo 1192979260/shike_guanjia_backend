@@ -1,5 +1,14 @@
 import type { Lesson, LessonTimeSlot, RecurringRule, TrainingClass } from './types.js';
-import { businessTimestamp, parseBusinessDateTime, toLocalIso } from './date-time.js';
+import {
+  businessDateFromParts,
+  businessDateParts,
+  businessAddDays,
+  businessAddMonths,
+  businessStartOfDay,
+  businessTimestamp,
+  parseBusinessDateTime,
+  toLocalIso,
+} from './date-time.js';
 
 export function generateLessonsForClass(trainingClass: TrainingClass, makeId: () => string, existingManual: Lesson[] = []): Lesson[] {
   const lessons: Lesson[] = [];
@@ -11,19 +20,24 @@ export function generateLessonsForClass(trainingClass: TrainingClass, makeId: ()
     if (lessons.length >= max || date > end) return;
     const scheduledDate = withTime(date, slot.startHour, slot.startMinute);
     const scheduledEndDate = withTime(date, slot.endHour, slot.endMinute);
-    if (scheduledDate.getDay() !== slot.dayOfWeek || scheduledDate < start || scheduledDate > end) return;
+    if (businessDateParts(scheduledDate).dayOfWeek !== slot.dayOfWeek || scheduledDate < start || scheduledDate > end) return;
     lessons.push({
       id: makeId(),
       classId: trainingClass.id,
       scheduledDate: toLocalIso(scheduledDate),
       scheduledEndDate: toLocalIso(scheduledEndDate),
       status: 'scheduled',
+      sourceType: isMakeup ? 'manual_makeup' : 'generated',
+      attendanceStatus: 'pending',
+      changeStatus: 'normal',
       actualDate: null,
       checkinTime: null,
       isMakeup,
       notes: null,
       leaveReason: null,
       isManual: false,
+      originLessonId: null,
+      changeBatchId: null,
     });
   };
 
@@ -31,13 +45,14 @@ export function generateLessonsForClass(trainingClass: TrainingClass, makeId: ()
     const slot = rule.timeSlots[0];
     if (!slot) return existingManual;
     const interval = rule.customIntervalDays ?? 7;
-    for (let date = new Date(start); lessons.length < max && date <= end; date = addDays(date, interval)) pushLesson(date, slot);
+    for (let date = new Date(start); lessons.length < max && date <= end; date = businessAddDays(date, interval)) pushLesson(date, slot);
   } else {
-    for (let date = startOfDay(start); lessons.length < max && date <= end; date = addDays(date, 1)) {
+    for (let date = businessStartOfDay(start); lessons.length < max && date <= end; date = businessAddDays(date, 1)) {
       for (const slot of rule.timeSlots) {
         if (lessons.length >= max) break;
-        if (rule.type === 'weekly' && slot.dayOfWeek === date.getDay()) pushLesson(date, slot);
-        if (rule.type === 'monthly' && slot.dayOfWeek === date.getDay() && nthWeekdayOfMonth(date) === (rule.weekOfMonth ?? 1)) pushLesson(date, slot);
+        const parts = businessDateParts(date);
+        if (rule.type === 'weekly' && slot.dayOfWeek === parts.dayOfWeek) pushLesson(date, slot);
+        if (rule.type === 'monthly' && slot.dayOfWeek === parts.dayOfWeek && nthWeekdayOfMonth(date) === (rule.weekOfMonth ?? 1)) pushLesson(date, slot);
       }
     }
   }
@@ -61,29 +76,14 @@ export function nextLessonAfter(trainingClass: TrainingClass, after: Date, makeI
 }
 
 function withTime(date: Date, hour: number, minute: number) {
-  const copy = new Date(date);
-  copy.setHours(hour, minute, 0, 0);
-  return copy;
-}
-
-function startOfDay(date: Date) {
-  const copy = new Date(date);
-  copy.setHours(0, 0, 0, 0);
-  return copy;
-}
-
-function addDays(date: Date, days: number) {
-  const copy = new Date(date);
-  copy.setDate(copy.getDate() + days);
-  return copy;
+  const parts = businessDateParts(date);
+  return businessDateFromParts(parts.year, parts.month, parts.day, hour, minute);
 }
 
 function addMonths(date: Date, months: number) {
-  const copy = new Date(date);
-  copy.setMonth(copy.getMonth() + months);
-  return copy;
+  return businessAddMonths(date, months);
 }
 
 function nthWeekdayOfMonth(date: Date) {
-  return Math.floor((date.getDate() - 1) / 7) + 1;
+  return Math.floor((businessDateParts(date).day - 1) / 7) + 1;
 }

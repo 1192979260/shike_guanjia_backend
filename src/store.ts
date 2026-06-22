@@ -433,6 +433,14 @@ export class MysqlStore extends MemoryStore {
   override reset() {
     super.reset();
     this.enqueueWrite(async () => {
+      await this.pool.execute("DELETE FROM theme_preferences");
+      await this.pool.execute("DELETE FROM reminder_subscriptions");
+      await this.pool.execute("DELETE FROM reminder_settings");
+      await this.pool.execute("DELETE FROM suspensions");
+      await this.pool.execute("DELETE FROM sessions");
+      await this.pool.execute("DELETE FROM lesson_changes");
+      await this.pool.execute("DELETE FROM leaves");
+      await this.pool.execute("DELETE FROM attendance");
       await this.pool.execute("DELETE FROM lessons");
       await this.pool.execute("DELETE FROM classes");
       await this.pool.execute("DELETE FROM children");
@@ -440,7 +448,6 @@ export class MysqlStore extends MemoryStore {
       await this.pool.execute("DELETE FROM families");
       await this.pool.execute("DELETE FROM users");
       await this.pool.execute("DELETE FROM auth_credentials");
-      await this.pool.execute("DELETE FROM kv_store");
     });
   }
 
@@ -449,7 +456,7 @@ export class MysqlStore extends MemoryStore {
     this.refreshing = true;
     try {
       await this.waitForIdle();
-      await this.refreshCoreTables();
+      await this.refreshTables();
     } finally {
       this.refreshing = false;
     }
@@ -466,58 +473,10 @@ export class MysqlStore extends MemoryStore {
 
   private async initialize() {
     await this.createCoreTables();
+    await this.createAuxiliaryTables();
     await this.dropCoreForeignKeys();
-    await this.pool.execute(`
-      CREATE TABLE IF NOT EXISTS kv_store (
-        collection VARCHAR(64) NOT NULL,
-        id VARCHAR(191) NOT NULL,
-        value JSON NOT NULL,
-        PRIMARY KEY (collection, id)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-    `);
-    await this.migrateCoreCollectionsFromKv();
-    await this.refreshCoreTables();
-    await this.loadCollection(
-      "attendance",
-      this.attendance,
-      (item: Attendance) => item.id,
-    );
-    await this.loadCollection(
-      "leaves",
-      this.leaves,
-      (item: LeaveRecord) => item.id,
-    );
-    await this.loadCollection(
-      "lesson_changes",
-      this.lessonChanges,
-      (item: LessonChangeRecord) => item.id,
-    );
-    await this.loadCollection(
-      "sessions",
-      this.sessions,
-      (item: Session) => item.token,
-    );
-    await this.loadCollection(
-      "suspensions",
-      this.suspensions,
-      (item: SuspensionPeriod) => item.id,
-    );
-    await this.loadCollection(
-      "reminderSettings",
-      this.reminderSettings,
-      (item: ReminderSettings) => item.familyId,
-    );
-    await this.loadCollection(
-      "reminderSubscriptions",
-      this.reminderSubscriptions,
-      (item: LessonReminderSubscription) => item.id,
-    );
-    await this.loadCollection(
-      "themePreferences",
-      this.themePreferences,
-      (item: ThemePreference) => item.userId,
-    );
-    this.wrapKvMaps();
+    await this.migrateLegacyKvStore();
+    await this.refreshTables();
   }
 
   private async createCoreTables() {
@@ -572,6 +531,7 @@ export class MysqlStore extends MemoryStore {
         teacher_name VARCHAR(255) NULL,
         teacher_phone VARCHAR(32) NULL,
         total_hours DOUBLE NOT NULL,
+        historical_used_hours DOUBLE NULL,
         used_hours DOUBLE NOT NULL,
         remaining_hours DOUBLE NOT NULL,
         total_fee DOUBLE NOT NULL,
@@ -593,22 +553,149 @@ export class MysqlStore extends MemoryStore {
         scheduled_date VARCHAR(64) NOT NULL,
         scheduled_end_date VARCHAR(64) NULL,
         status VARCHAR(32) NOT NULL,
+        source_type VARCHAR(32) NULL,
+        attendance_status VARCHAR(64) NULL,
+        change_status VARCHAR(32) NULL,
         actual_date VARCHAR(64) NULL,
         checkin_time VARCHAR(64) NULL,
         is_makeup BOOLEAN NOT NULL DEFAULT FALSE,
         notes TEXT NULL,
         leave_reason TEXT NULL,
         is_manual BOOLEAN NULL,
+        origin_lesson_id VARCHAR(191) NULL,
+        change_batch_id VARCHAR(191) NULL,
         INDEX idx_lessons_class_id (class_id),
         INDEX idx_lessons_scheduled_date (scheduled_date)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
+    await this.addColumnIfMissing("classes", "historical_used_hours", "DOUBLE NULL");
+    await this.addColumnIfMissing("lessons", "source_type", "VARCHAR(32) NULL");
+    await this.addColumnIfMissing("lessons", "attendance_status", "VARCHAR(64) NULL");
+    await this.addColumnIfMissing("lessons", "change_status", "VARCHAR(32) NULL");
+    await this.addColumnIfMissing("lessons", "origin_lesson_id", "VARCHAR(191) NULL");
+    await this.addColumnIfMissing("lessons", "change_batch_id", "VARCHAR(191) NULL");
     await this.pool.execute(`
       CREATE TABLE IF NOT EXISTS auth_credentials (
         phone VARCHAR(32) NOT NULL PRIMARY KEY,
         password_hash VARCHAR(255) NOT NULL,
         salt VARCHAR(255) NOT NULL,
         created_at VARCHAR(64) NOT NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+  }
+
+  private async createAuxiliaryTables() {
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        token VARCHAR(191) NOT NULL PRIMARY KEY,
+        user_id VARCHAR(191) NOT NULL,
+        created_at VARCHAR(64) NOT NULL,
+        INDEX idx_sessions_user_id (user_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS attendance (
+        id VARCHAR(191) NOT NULL PRIMARY KEY,
+        lesson_id VARCHAR(191) NOT NULL,
+        class_id VARCHAR(191) NOT NULL,
+        child_id VARCHAR(191) NOT NULL,
+        checkin_time VARCHAR(64) NOT NULL,
+        type VARCHAR(32) NOT NULL,
+        actual_start_time VARCHAR(64) NULL,
+        actual_end_time VARCHAR(64) NULL,
+        notes TEXT NULL,
+        created_at VARCHAR(64) NOT NULL,
+        INDEX idx_attendance_lesson_id (lesson_id),
+        INDEX idx_attendance_class_id (class_id),
+        INDEX idx_attendance_child_id (child_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS leaves (
+        id VARCHAR(191) NOT NULL PRIMARY KEY,
+        lesson_id VARCHAR(191) NOT NULL,
+        class_id VARCHAR(191) NOT NULL,
+        child_id VARCHAR(191) NOT NULL,
+        request_time VARCHAR(64) NOT NULL,
+        status VARCHAR(32) NOT NULL,
+        reason TEXT NULL,
+        makeup_lesson_id VARCHAR(191) NULL,
+        created_at VARCHAR(64) NOT NULL,
+        INDEX idx_leaves_lesson_id (lesson_id),
+        INDEX idx_leaves_class_id (class_id),
+        INDEX idx_leaves_child_id (child_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS lesson_changes (
+        id VARCHAR(191) NOT NULL PRIMARY KEY,
+        lesson_id VARCHAR(191) NOT NULL,
+        class_id VARCHAR(191) NOT NULL,
+        child_id VARCHAR(191) NOT NULL,
+        type VARCHAR(32) NOT NULL,
+        source VARCHAR(32) NOT NULL,
+        reason TEXT NULL,
+        description TEXT NULL,
+        original_start_at VARCHAR(64) NOT NULL,
+        original_end_at VARCHAR(64) NULL,
+        new_scheduled_date VARCHAR(64) NULL,
+        new_scheduled_end_date VARCHAR(64) NULL,
+        makeup_lesson_id VARCHAR(191) NULL,
+        replacement_lesson_id VARCHAR(191) NULL,
+        new_lesson_id VARCHAR(191) NULL,
+        status VARCHAR(32) NOT NULL,
+        created_at VARCHAR(64) NOT NULL,
+        INDEX idx_lesson_changes_lesson_id (lesson_id),
+        INDEX idx_lesson_changes_class_id (class_id),
+        INDEX idx_lesson_changes_child_id (child_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS suspensions (
+        id VARCHAR(191) NOT NULL PRIMARY KEY,
+        class_id VARCHAR(191) NOT NULL,
+        start_time VARCHAR(64) NOT NULL,
+        end_time VARCHAR(64) NOT NULL,
+        INDEX idx_suspensions_class_id (class_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS reminder_settings (
+        family_id VARCHAR(191) NOT NULL PRIMARY KEY,
+        enabled BOOLEAN NOT NULL,
+        advance_minutes INT NOT NULL,
+        include_today_lessons BOOLEAN NOT NULL,
+        include_makeup_lessons BOOLEAN NOT NULL,
+        updated_at VARCHAR(64) NOT NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS reminder_subscriptions (
+        id VARCHAR(191) NOT NULL PRIMARY KEY,
+        family_id VARCHAR(191) NOT NULL,
+        user_id VARCHAR(191) NOT NULL,
+        lesson_id VARCHAR(191) NOT NULL,
+        template_id VARCHAR(191) NOT NULL,
+        advance_minutes INT NOT NULL,
+        scheduled_at VARCHAR(64) NOT NULL,
+        remind_at VARCHAR(64) NOT NULL,
+        page TEXT NULL,
+        status VARCHAR(32) NOT NULL,
+        sent_at VARCHAR(64) NULL,
+        failure_reason TEXT NULL,
+        created_at VARCHAR(64) NOT NULL,
+        updated_at VARCHAR(64) NOT NULL,
+        INDEX idx_reminder_subscriptions_family_id (family_id),
+        INDEX idx_reminder_subscriptions_user_id (user_id),
+        INDEX idx_reminder_subscriptions_lesson_id (lesson_id),
+        INDEX idx_reminder_subscriptions_remind_at (remind_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS theme_preferences (
+        user_id VARCHAR(191) NOT NULL PRIMARY KEY,
+        skin VARCHAR(32) NOT NULL,
+        updated_at VARCHAR(64) NOT NULL
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
   }
@@ -673,6 +760,96 @@ export class MysqlStore extends MemoryStore {
       await this.setCoreRecordNow("authCredentials", item.phone, item);
   }
 
+  private async hasAnyCoreRows() {
+    const tables = [
+      "users",
+      "families",
+      "children",
+      "classes",
+      "lessons",
+      "auth_credentials",
+    ];
+    for (const table of tables) {
+      const [rows] = await this.pool.query<RowDataPacket[]>(
+        `SELECT 1 FROM ${table} LIMIT 1`,
+      );
+      if (rows.length > 0) return true;
+    }
+    return false;
+  }
+
+  private async migrateLegacyKvStore() {
+    if (!(await this.tableExists("kv_store"))) return;
+
+    if (!(await this.hasAnyCoreRows())) await this.migrateCoreCollectionsFromKv();
+    await this.migrateAuxiliaryCollectionsFromKv();
+    await this.pool.execute("DROP TABLE kv_store");
+  }
+
+  private async migrateAuxiliaryCollectionsFromKv() {
+    if (await this.tableIsEmpty("attendance")) {
+      for (const item of await this.loadKvCollection<Attendance>("attendance"))
+        await this.setAuxiliaryRecordNow("attendance", item.id, item);
+    }
+    if (await this.tableIsEmpty("leaves")) {
+      for (const item of await this.loadKvCollection<LeaveRecord>("leaves"))
+        await this.setAuxiliaryRecordNow("leaves", item.id, item);
+    }
+    if (await this.tableIsEmpty("lesson_changes")) {
+      for (const item of await this.loadKvCollection<LessonChangeRecord>(
+        "lesson_changes",
+      ))
+        await this.setAuxiliaryRecordNow("lesson_changes", item.id, item);
+    }
+    if (await this.tableIsEmpty("sessions")) {
+      for (const item of await this.loadKvCollection<Session>("sessions"))
+        await this.setAuxiliaryRecordNow("sessions", item.token, item);
+    }
+    if (await this.tableIsEmpty("suspensions")) {
+      for (const item of await this.loadKvCollection<SuspensionPeriod>(
+        "suspensions",
+      ))
+        await this.setAuxiliaryRecordNow("suspensions", item.id, item);
+    }
+    if (await this.tableIsEmpty("reminder_settings")) {
+      for (const item of await this.loadKvCollection<ReminderSettings>(
+        "reminderSettings",
+      ))
+        await this.setAuxiliaryRecordNow("reminderSettings", item.familyId, item);
+    }
+    if (await this.tableIsEmpty("reminder_subscriptions")) {
+      for (const item of await this.loadKvCollection<LessonReminderSubscription>(
+        "reminderSubscriptions",
+      ))
+        await this.setAuxiliaryRecordNow(
+          "reminderSubscriptions",
+          item.id,
+          item,
+        );
+    }
+    if (await this.tableIsEmpty("theme_preferences")) {
+      for (const item of await this.loadKvCollection<ThemePreference>(
+        "themePreferences",
+      ))
+        await this.setAuxiliaryRecordNow("themePreferences", item.userId, item);
+    }
+  }
+
+  private async tableExists(table: string) {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1",
+      [table],
+    );
+    return rows.length > 0;
+  }
+
+  private async tableIsEmpty(table: string) {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT 1 FROM ${table} LIMIT 1`,
+    );
+    return rows.length === 0;
+  }
+
   private async loadKvCollection<T>(collection: string) {
     const [rows] = await this.pool.query<KvRow[]>(
       "SELECT value FROM kv_store WHERE collection = ?",
@@ -683,13 +860,21 @@ export class MysqlStore extends MemoryStore {
     );
   }
 
-  private async refreshCoreTables() {
+  private async refreshTables() {
     const users = await this.loadUsersTable();
     const families = await this.loadFamiliesTable();
     const children = await this.loadChildrenTable();
     const classes = await this.loadClassesTable();
     const lessons = await this.loadLessonsTable();
     const authCredentials = await this.loadAuthCredentialsTable();
+    const attendance = await this.loadAttendanceTable();
+    const leaves = await this.loadLeavesTable();
+    const lessonChanges = await this.loadLessonChangesTable();
+    const sessions = await this.loadSessionsTable();
+    const suspensions = await this.loadSuspensionsTable();
+    const reminderSettings = await this.loadReminderSettingsTable();
+    const reminderSubscriptions = await this.loadReminderSubscriptionsTable();
+    const themePreferences = await this.loadThemePreferencesTable();
 
     this.users = this.persistedMap("users", users);
     this.families = this.persistedMap("families", families);
@@ -699,6 +884,23 @@ export class MysqlStore extends MemoryStore {
     this.authCredentials = this.persistedMap(
       "authCredentials",
       authCredentials,
+    );
+    this.attendance = this.persistedMap("attendance", attendance);
+    this.leaves = this.persistedMap("leaves", leaves);
+    this.lessonChanges = this.persistedMap("lesson_changes", lessonChanges);
+    this.sessions = this.persistedMap("sessions", sessions);
+    this.suspensions = this.persistedMap("suspensions", suspensions);
+    this.reminderSettings = this.persistedMap(
+      "reminderSettings",
+      reminderSettings,
+    );
+    this.reminderSubscriptions = this.persistedMap(
+      "reminderSubscriptions",
+      reminderSubscriptions,
+    );
+    this.themePreferences = this.persistedMap(
+      "themePreferences",
+      themePreferences,
     );
   }
 
@@ -786,6 +988,11 @@ export class MysqlStore extends MemoryStore {
           teacherName: row.teacher_name,
           teacherPhone: row.teacher_phone,
           totalHours: Number(row.total_hours),
+          historicalUsedHours:
+            row.historical_used_hours === null ||
+            row.historical_used_hours === undefined
+              ? null
+              : Number(row.historical_used_hours),
           usedHours: Number(row.used_hours),
           remainingHours: Number(row.remaining_hours),
           totalFee: Number(row.total_fee),
@@ -814,6 +1021,9 @@ export class MysqlStore extends MemoryStore {
           scheduledDate: row.scheduled_date,
           scheduledEndDate: row.scheduled_end_date,
           status: row.status,
+          sourceType: row.source_type,
+          attendanceStatus: row.attendance_status,
+          changeStatus: row.change_status,
           actualDate: row.actual_date,
           checkinTime: row.checkin_time,
           isMakeup: Boolean(row.is_makeup),
@@ -823,6 +1033,8 @@ export class MysqlStore extends MemoryStore {
             row.is_manual === null || row.is_manual === undefined
               ? undefined
               : Boolean(row.is_manual),
+          originLessonId: row.origin_lesson_id,
+          changeBatchId: row.change_batch_id,
         }) as Lesson,
       ]),
     );
@@ -845,41 +1057,171 @@ export class MysqlStore extends MemoryStore {
     );
   }
 
-  private async loadCollection<T>(
-    collection: string,
-    target: Map<string, T>,
-    getId: (item: T) => string,
-  ) {
-    const [rows] = await this.pool.query<KvRow[]>(
-      "SELECT value FROM kv_store WHERE collection = ?",
-      [collection],
+  private async loadAttendanceTable() {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      "SELECT * FROM attendance",
     );
-    for (const row of rows) {
-      const item = normalizeStoredDates(parseStoredValue(row.value)) as T;
-      target.set(getId(item), item);
-    }
+    return new Map(
+      rows.map((row) => [
+        String(row.id),
+        normalizeStoredDates({
+          id: row.id,
+          lessonId: row.lesson_id,
+          classId: row.class_id,
+          childId: row.child_id,
+          checkinTime: row.checkin_time,
+          type: row.type,
+          actualStartTime: row.actual_start_time,
+          actualEndTime: row.actual_end_time,
+          notes: row.notes,
+          createdAt: row.created_at,
+        }) as Attendance,
+      ]),
+    );
   }
 
-  private wrapKvMaps() {
-    this.attendance = this.persistedMap("attendance", this.attendance);
-    this.leaves = this.persistedMap("leaves", this.leaves);
-    this.lessonChanges = this.persistedMap(
-      "lesson_changes",
-      this.lessonChanges,
+  private async loadLeavesTable() {
+    const [rows] = await this.pool.query<RowDataPacket[]>("SELECT * FROM leaves");
+    return new Map(
+      rows.map((row) => [
+        String(row.id),
+        normalizeStoredDates({
+          id: row.id,
+          lessonId: row.lesson_id,
+          classId: row.class_id,
+          childId: row.child_id,
+          requestTime: row.request_time,
+          status: row.status,
+          reason: row.reason,
+          makeupLessonId: row.makeup_lesson_id,
+          createdAt: row.created_at,
+        }) as LeaveRecord,
+      ]),
     );
-    this.sessions = this.persistedMap("sessions", this.sessions);
-    this.suspensions = this.persistedMap("suspensions", this.suspensions);
-    this.reminderSettings = this.persistedMap(
-      "reminderSettings",
-      this.reminderSettings,
+  }
+
+  private async loadLessonChangesTable() {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      "SELECT * FROM lesson_changes",
     );
-    this.reminderSubscriptions = this.persistedMap(
-      "reminderSubscriptions",
-      this.reminderSubscriptions,
+    return new Map(
+      rows.map((row) => [
+        String(row.id),
+        normalizeStoredDates({
+          id: row.id,
+          lessonId: row.lesson_id,
+          classId: row.class_id,
+          childId: row.child_id,
+          type: row.type,
+          source: row.source,
+          reason: row.reason,
+          description: row.description,
+          originalStartAt: row.original_start_at,
+          originalEndAt: row.original_end_at,
+          newScheduledDate: row.new_scheduled_date,
+          newScheduledEndDate: row.new_scheduled_end_date,
+          makeupLessonId: row.makeup_lesson_id,
+          replacementLessonId: row.replacement_lesson_id,
+          newLessonId: row.new_lesson_id,
+          status: row.status,
+          createdAt: row.created_at,
+        }) as LessonChangeRecord,
+      ]),
     );
-    this.themePreferences = this.persistedMap(
-      "themePreferences",
-      this.themePreferences,
+  }
+
+  private async loadSessionsTable() {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      "SELECT * FROM sessions",
+    );
+    return new Map(
+      rows.map((row) => [
+        String(row.token),
+        normalizeStoredDates({
+          token: row.token,
+          userId: row.user_id,
+          createdAt: row.created_at,
+        }) as Session,
+      ]),
+    );
+  }
+
+  private async loadSuspensionsTable() {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      "SELECT * FROM suspensions",
+    );
+    return new Map(
+      rows.map((row) => [
+        String(row.id),
+        normalizeStoredDates({
+          id: row.id,
+          classId: row.class_id,
+          start: row.start_time,
+          end: row.end_time,
+        }) as SuspensionPeriod,
+      ]),
+    );
+  }
+
+  private async loadReminderSettingsTable() {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      "SELECT * FROM reminder_settings",
+    );
+    return new Map(
+      rows.map((row) => [
+        String(row.family_id),
+        normalizeStoredDates({
+          familyId: row.family_id,
+          enabled: Boolean(row.enabled),
+          advanceMinutes: Number(row.advance_minutes),
+          includeTodayLessons: Boolean(row.include_today_lessons),
+          includeMakeupLessons: Boolean(row.include_makeup_lessons),
+          updatedAt: row.updated_at,
+        }) as ReminderSettings,
+      ]),
+    );
+  }
+
+  private async loadReminderSubscriptionsTable() {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      "SELECT * FROM reminder_subscriptions",
+    );
+    return new Map(
+      rows.map((row) => [
+        String(row.id),
+        normalizeStoredDates({
+          id: row.id,
+          familyId: row.family_id,
+          userId: row.user_id,
+          lessonId: row.lesson_id,
+          templateId: row.template_id,
+          advanceMinutes: Number(row.advance_minutes),
+          scheduledAt: row.scheduled_at,
+          remindAt: row.remind_at,
+          page: row.page,
+          status: row.status,
+          sentAt: row.sent_at,
+          failureReason: row.failure_reason,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at,
+        }) as LessonReminderSubscription,
+      ]),
+    );
+  }
+
+  private async loadThemePreferencesTable() {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      "SELECT * FROM theme_preferences",
+    );
+    return new Map(
+      rows.map((row) => [
+        String(row.user_id),
+        normalizeStoredDates({
+          userId: row.user_id,
+          skin: row.skin,
+          updatedAt: row.updated_at,
+        }) as ThemePreference,
+      ]),
     );
   }
 
@@ -894,46 +1236,24 @@ export class MysqlStore extends MemoryStore {
 
   private persistCollection<T>(collection: string, source: Map<string, T>) {
     this.enqueueWrite(async () => {
-      if (this.isCoreCollection(collection)) {
-        await this.deleteCoreCollectionNow(collection);
-        for (const [key, value] of source.entries())
-          await this.setCoreRecordNow(collection, key, value);
-        return;
-      }
-      await this.pool.execute("DELETE FROM kv_store WHERE collection = ?", [
-        collection,
-      ]);
+      await this.deleteCollectionNow(collection);
       for (const [key, value] of source.entries())
         await this.setRecordNow(collection, key, value);
     });
   }
 
   private setRecord<T>(collection: string, key: string, value: T) {
-    this.enqueueWrite(() =>
-      this.isCoreCollection(collection)
-        ? this.setCoreRecordNow(collection, key, value)
-        : this.setRecordNow(collection, key, value),
-    );
+    this.enqueueWrite(() => this.setRecordNow(collection, key, value));
   }
 
   private async setRecordNow<T>(collection: string, key: string, value: T) {
-    await this.pool.execute(
-      "INSERT INTO kv_store (collection, id, value) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)",
-      [collection, key, JSON.stringify(value)],
-    );
+    if (this.isCoreCollection(collection))
+      return this.setCoreRecordNow(collection, key, value);
+    return this.setAuxiliaryRecordNow(collection, key, value);
   }
 
   private deleteRecord(collection: string, key: string) {
-    this.enqueueWrite(async () => {
-      if (this.isCoreCollection(collection)) {
-        await this.deleteCoreRecordNow(collection, key);
-        return;
-      }
-      await this.pool.execute(
-        "DELETE FROM kv_store WHERE collection = ? AND id = ?",
-        [collection, key],
-      );
-    });
+    this.enqueueWrite(() => this.deleteRecordNow(collection, key));
   }
 
   private isCoreCollection(collection: string) {
@@ -947,24 +1267,26 @@ export class MysqlStore extends MemoryStore {
     );
   }
 
-  private async deleteCoreCollectionNow(collection: string) {
-    const table = this.coreTableName(collection);
+  private async deleteCollectionNow(collection: string) {
+    const table = this.collectionTableName(collection);
+    if (collection === "families")
+      await this.pool.execute("DELETE FROM family_members");
     await this.pool.execute(`DELETE FROM ${table}`);
   }
 
-  private async deleteCoreRecordNow(collection: string, key: string) {
+  private async deleteRecordNow(collection: string, key: string) {
     if (collection === "authCredentials") {
       await this.pool.execute("DELETE FROM auth_credentials WHERE phone = ?", [
         key,
       ]);
       return;
     }
-    await this.pool.execute(`DELETE FROM ${this.coreTableName(collection)} WHERE id = ?`, [
-      key,
-    ]);
+    const table = this.collectionTableName(collection);
+    const keyColumn = this.collectionKeyColumn(collection);
+    await this.pool.execute(`DELETE FROM ${table} WHERE ${keyColumn} = ?`, [key]);
   }
 
-  private coreTableName(collection: string) {
+  private collectionTableName(collection: string) {
     switch (collection) {
       case "users":
         return "users";
@@ -978,8 +1300,39 @@ export class MysqlStore extends MemoryStore {
         return "lessons";
       case "authCredentials":
         return "auth_credentials";
+      case "attendance":
+        return "attendance";
+      case "leaves":
+        return "leaves";
+      case "lesson_changes":
+        return "lesson_changes";
+      case "sessions":
+        return "sessions";
+      case "suspensions":
+        return "suspensions";
+      case "reminderSettings":
+        return "reminder_settings";
+      case "reminderSubscriptions":
+        return "reminder_subscriptions";
+      case "themePreferences":
+        return "theme_preferences";
       default:
-        throw new Error(`Unknown core collection: ${collection}`);
+        throw new Error(`Unknown collection: ${collection}`);
+    }
+  }
+
+  private collectionKeyColumn(collection: string) {
+    switch (collection) {
+      case "authCredentials":
+        return "phone";
+      case "sessions":
+        return "token";
+      case "reminderSettings":
+        return "family_id";
+      case "themePreferences":
+        return "user_id";
+      default:
+        return "id";
     }
   }
 
@@ -1070,10 +1423,10 @@ export class MysqlStore extends MemoryStore {
       await this.pool.execute(
         `INSERT INTO classes
           (id, child_id, family_id, institution_name, class_name, course_name,
-           teacher_name, teacher_phone, total_hours, used_hours,
+           teacher_name, teacher_phone, total_hours, historical_used_hours, used_hours,
            remaining_hours, total_fee, start_time, end_time, recurring_rule,
            status, created_at, updated_at, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            child_id = VALUES(child_id),
            family_id = VALUES(family_id),
@@ -1083,6 +1436,7 @@ export class MysqlStore extends MemoryStore {
            teacher_name = VALUES(teacher_name),
            teacher_phone = VALUES(teacher_phone),
            total_hours = VALUES(total_hours),
+           historical_used_hours = VALUES(historical_used_hours),
            used_hours = VALUES(used_hours),
            remaining_hours = VALUES(remaining_hours),
            total_fee = VALUES(total_fee),
@@ -1103,6 +1457,7 @@ export class MysqlStore extends MemoryStore {
           item.teacherName ?? null,
           item.teacherPhone ?? null,
           item.totalHours,
+          item.historicalUsedHours ?? null,
           item.usedHours,
           item.remainingHours,
           item.totalFee,
@@ -1122,31 +1477,42 @@ export class MysqlStore extends MemoryStore {
       await this.pool.execute(
         `INSERT INTO lessons
           (id, class_id, scheduled_date, scheduled_end_date, status,
-           actual_date, checkin_time, is_makeup, notes, leave_reason, is_manual)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           source_type, attendance_status, change_status, actual_date, checkin_time,
+           is_makeup, notes, leave_reason, is_manual, origin_lesson_id, change_batch_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            class_id = VALUES(class_id),
            scheduled_date = VALUES(scheduled_date),
            scheduled_end_date = VALUES(scheduled_end_date),
            status = VALUES(status),
+           source_type = VALUES(source_type),
+           attendance_status = VALUES(attendance_status),
+           change_status = VALUES(change_status),
            actual_date = VALUES(actual_date),
            checkin_time = VALUES(checkin_time),
            is_makeup = VALUES(is_makeup),
            notes = VALUES(notes),
            leave_reason = VALUES(leave_reason),
-           is_manual = VALUES(is_manual)`,
+           is_manual = VALUES(is_manual),
+           origin_lesson_id = VALUES(origin_lesson_id),
+           change_batch_id = VALUES(change_batch_id)`,
         [
           item.id,
           item.classId,
           item.scheduledDate,
           item.scheduledEndDate ?? null,
           item.status,
+          item.sourceType ?? null,
+          item.attendanceStatus ?? null,
+          item.changeStatus ?? null,
           item.actualDate ?? null,
           item.checkinTime ?? null,
           item.isMakeup,
           item.notes ?? null,
           item.leaveReason ?? null,
           item.isManual ?? null,
+          item.originLessonId ?? null,
+          item.changeBatchId ?? null,
         ],
       );
       return;
@@ -1163,6 +1529,226 @@ export class MysqlStore extends MemoryStore {
         [item.phone, item.passwordHash, item.salt, item.createdAt],
       );
     }
+  }
+
+  private async setAuxiliaryRecordNow<T>(
+    collection: string,
+    key: string,
+    value: T,
+  ) {
+    if (collection === "sessions") {
+      const item = value as Session;
+      await this.pool.execute(
+        `INSERT INTO sessions (token, user_id, created_at)
+         VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           user_id = VALUES(user_id),
+           created_at = VALUES(created_at)`,
+        [item.token, item.userId, item.createdAt],
+      );
+      return;
+    }
+    if (collection === "attendance") {
+      const item = value as Attendance;
+      await this.pool.execute(
+        `INSERT INTO attendance
+          (id, lesson_id, class_id, child_id, checkin_time, type,
+           actual_start_time, actual_end_time, notes, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           lesson_id = VALUES(lesson_id),
+           class_id = VALUES(class_id),
+           child_id = VALUES(child_id),
+           checkin_time = VALUES(checkin_time),
+           type = VALUES(type),
+           actual_start_time = VALUES(actual_start_time),
+           actual_end_time = VALUES(actual_end_time),
+           notes = VALUES(notes),
+           created_at = VALUES(created_at)`,
+        [
+          item.id,
+          item.lessonId,
+          item.classId,
+          item.childId,
+          item.checkinTime,
+          item.type,
+          item.actualStartTime ?? null,
+          item.actualEndTime ?? null,
+          item.notes ?? null,
+          item.createdAt,
+        ],
+      );
+      return;
+    }
+    if (collection === "leaves") {
+      const item = value as LeaveRecord;
+      await this.pool.execute(
+        `INSERT INTO leaves
+          (id, lesson_id, class_id, child_id, request_time, status,
+           reason, makeup_lesson_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           lesson_id = VALUES(lesson_id),
+           class_id = VALUES(class_id),
+           child_id = VALUES(child_id),
+           request_time = VALUES(request_time),
+           status = VALUES(status),
+           reason = VALUES(reason),
+           makeup_lesson_id = VALUES(makeup_lesson_id),
+           created_at = VALUES(created_at)`,
+        [
+          item.id,
+          item.lessonId,
+          item.classId,
+          item.childId,
+          item.requestTime,
+          item.status,
+          item.reason ?? null,
+          item.makeupLessonId ?? null,
+          item.createdAt,
+        ],
+      );
+      return;
+    }
+    if (collection === "lesson_changes") {
+      const item = value as LessonChangeRecord;
+      await this.pool.execute(
+        `INSERT INTO lesson_changes
+          (id, lesson_id, class_id, child_id, type, source, reason, description,
+           original_start_at, original_end_at, new_scheduled_date,
+           new_scheduled_end_date, makeup_lesson_id, replacement_lesson_id,
+           new_lesson_id, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           lesson_id = VALUES(lesson_id),
+           class_id = VALUES(class_id),
+           child_id = VALUES(child_id),
+           type = VALUES(type),
+           source = VALUES(source),
+           reason = VALUES(reason),
+           description = VALUES(description),
+           original_start_at = VALUES(original_start_at),
+           original_end_at = VALUES(original_end_at),
+           new_scheduled_date = VALUES(new_scheduled_date),
+           new_scheduled_end_date = VALUES(new_scheduled_end_date),
+           makeup_lesson_id = VALUES(makeup_lesson_id),
+           replacement_lesson_id = VALUES(replacement_lesson_id),
+           new_lesson_id = VALUES(new_lesson_id),
+           status = VALUES(status),
+           created_at = VALUES(created_at)`,
+        [
+          item.id,
+          item.lessonId,
+          item.classId,
+          item.childId,
+          item.type,
+          item.source,
+          item.reason ?? null,
+          item.description ?? null,
+          item.originalStartAt,
+          item.originalEndAt ?? null,
+          item.newScheduledDate ?? null,
+          item.newScheduledEndDate ?? null,
+          item.makeupLessonId ?? null,
+          item.replacementLessonId ?? null,
+          item.newLessonId ?? null,
+          item.status,
+          item.createdAt,
+        ],
+      );
+      return;
+    }
+    if (collection === "suspensions") {
+      const item = value as SuspensionPeriod;
+      await this.pool.execute(
+        `INSERT INTO suspensions (id, class_id, start_time, end_time)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           class_id = VALUES(class_id),
+           start_time = VALUES(start_time),
+           end_time = VALUES(end_time)`,
+        [item.id, item.classId, item.start, item.end],
+      );
+      return;
+    }
+    if (collection === "reminderSettings") {
+      const item = value as ReminderSettings;
+      await this.pool.execute(
+        `INSERT INTO reminder_settings
+          (family_id, enabled, advance_minutes, include_today_lessons,
+           include_makeup_lessons, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           enabled = VALUES(enabled),
+           advance_minutes = VALUES(advance_minutes),
+           include_today_lessons = VALUES(include_today_lessons),
+           include_makeup_lessons = VALUES(include_makeup_lessons),
+           updated_at = VALUES(updated_at)`,
+        [
+          item.familyId,
+          item.enabled,
+          item.advanceMinutes,
+          item.includeTodayLessons,
+          item.includeMakeupLessons,
+          item.updatedAt,
+        ],
+      );
+      return;
+    }
+    if (collection === "reminderSubscriptions") {
+      const item = value as LessonReminderSubscription;
+      await this.pool.execute(
+        `INSERT INTO reminder_subscriptions
+          (id, family_id, user_id, lesson_id, template_id, advance_minutes,
+           scheduled_at, remind_at, page, status, sent_at, failure_reason,
+           created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           family_id = VALUES(family_id),
+           user_id = VALUES(user_id),
+           lesson_id = VALUES(lesson_id),
+           template_id = VALUES(template_id),
+           advance_minutes = VALUES(advance_minutes),
+           scheduled_at = VALUES(scheduled_at),
+           remind_at = VALUES(remind_at),
+           page = VALUES(page),
+           status = VALUES(status),
+           sent_at = VALUES(sent_at),
+           failure_reason = VALUES(failure_reason),
+           created_at = VALUES(created_at),
+           updated_at = VALUES(updated_at)`,
+        [
+          item.id,
+          item.familyId,
+          item.userId,
+          item.lessonId,
+          item.templateId,
+          item.advanceMinutes,
+          item.scheduledAt,
+          item.remindAt,
+          item.page ?? null,
+          item.status,
+          item.sentAt ?? null,
+          item.failureReason ?? null,
+          item.createdAt,
+          item.updatedAt,
+        ],
+      );
+      return;
+    }
+    if (collection === "themePreferences") {
+      const item = value as ThemePreference;
+      await this.pool.execute(
+        `INSERT INTO theme_preferences (user_id, skin, updated_at)
+         VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           skin = VALUES(skin),
+           updated_at = VALUES(updated_at)`,
+        [item.userId, item.skin, item.updatedAt],
+      );
+      return;
+    }
+    throw new Error(`Unknown auxiliary collection: ${collection}`);
   }
 
   private enqueueWrite(task: () => Promise<void>) {

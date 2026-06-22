@@ -2,11 +2,14 @@ export type FamilyRelation = 'mother' | 'father';
 export type ClassStatus = 'active' | 'paused' | 'ended';
 export type RecurringRuleType = 'weekly' | 'monthly' | 'custom';
 export type LessonStatus = 'scheduled' | 'completed' | 'leave' | 'rescheduled' | 'cancelled';
+export type LessonSourceType = 'generated' | 'manual_makeup';
+export type LessonAttendanceStatus = 'pending' | 'checked_in' | 'missed_needs_makeup_checkin';
 export type AttendanceType = 'checkin' | 'early_attempt' | 'backdated';
 export type LeaveStatus = 'approved' | 'cancelled';
 export type LessonChangeType = 'leave' | 'reschedule';
 export type LessonChangeSource = 'student' | 'teacher' | 'institution' | 'holiday' | 'other';
-export type LessonChangeStatus = 'active' | 'cancelled';
+export type LessonChangeLifecycleStatus = 'active' | 'cancelled';
+export type LessonChangeStatus = 'normal' | 'leave' | 'rescheduled' | 'cancelled';
 export type ThemeSkin = 'warm' | 'fresh' | 'classic';
 export type ReminderSubscriptionStatus = 'pending' | 'sent' | 'failed' | 'cancelled';
 
@@ -68,6 +71,7 @@ export interface TrainingClass {
   teacherName?: string | null;
   teacherPhone?: string | null;
   totalHours: number;
+  historicalUsedHours?: number | null;
   usedHours: number;
   remainingHours: number;
   totalFee: number;
@@ -86,12 +90,17 @@ export interface Lesson {
   scheduledDate: string;
   scheduledEndDate?: string | null;
   status: LessonStatus;
+  sourceType?: LessonSourceType | null;
+  attendanceStatus?: LessonAttendanceStatus | null;
+  changeStatus?: LessonChangeStatus | null;
   actualDate?: string | null;
   checkinTime?: string | null;
   isMakeup: boolean;
   notes?: string | null;
   leaveReason?: string | null;
   isManual?: boolean;
+  originLessonId?: string | null;
+  changeBatchId?: string | null;
 }
 
 export interface Attendance {
@@ -128,11 +137,21 @@ export interface LessonChangeRecord {
   type: LessonChangeType;
   source: LessonChangeSource;
   reason?: string | null;
+  description?: string | null;
   originalStartAt: string;
   originalEndAt?: string | null;
-  newLessonId: string;
-  status: LessonChangeStatus;
+  newScheduledDate?: string | null;
+  newScheduledEndDate?: string | null;
+  makeupLessonId?: string | null;
+  replacementLessonId?: string | null;
+  newLessonId?: string | null;
+  status: LessonChangeLifecycleStatus;
   createdAt: string;
+}
+
+export interface LessonHomePayload {
+  todayLessons: Lesson[];
+  needsBackfillLessons: Lesson[];
 }
 
 export interface SuspensionPeriod {

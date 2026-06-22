@@ -3,6 +3,7 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
+import { businessEndOfDay, businessStartOfDay, toLocalIso } from "./date-time.js";
 import { HttpError, errorBody, notFound } from "./errors.js";
 import type { AppService, AuthContext } from "./app-service.js";
 import { openApiSpec, swaggerHtml } from "./openapi.js";
@@ -223,11 +224,23 @@ function buildRoutes(service: AppService): Route[] {
     route("POST", "/api/classes/:classId/renew", true, (ctx) =>
       service.renewClass(a(ctx), p(ctx, "classId"), ctx.body),
     ),
+    route("PATCH", "/api/classes/:classId/schedule-rule", true, (ctx) =>
+      service.updateClass(a(ctx), p(ctx, "classId"), ctx.body),
+    ),
     route("POST", "/api/classes/:classId/generate-lessons", true, (ctx) =>
+      service.generateClassLessons(a(ctx), p(ctx, "classId")),
+    ),
+    route("POST", "/api/classes/:classId/regenerate-lessons", true, (ctx) =>
       service.generateClassLessons(a(ctx), p(ctx, "classId")),
     ),
     route("GET", "/api/classes/:classId/lessons", true, (ctx) =>
       service.getClassLessons(a(ctx), p(ctx, "classId")),
+    ),
+    route("GET", "/api/classes/:classId/lesson-change-records", true, (ctx) =>
+      service.lessonChangeHistory(
+        a(ctx),
+        new URLSearchParams({ classId: p(ctx, "classId") }),
+      ),
     ),
     route("GET", "/api/classes/:classId/conflicts", true, (ctx) =>
       service
@@ -239,18 +252,19 @@ function buildRoutes(service: AppService): Route[] {
       service.getLessonsInRange(a(ctx), q(ctx)),
     ),
     route("GET", "/api/lessons/today", true, (ctx) => {
-      const start = new Date();
-      start.setHours(0, 0, 0, 0);
-      const end = new Date(start);
-      end.setDate(end.getDate() + 1);
+      const start = businessStartOfDay();
+      const end = businessEndOfDay(start);
       return service.getLessonsInRange(
         a(ctx),
         new URLSearchParams({
-          start: start.toISOString(),
-          end: end.toISOString(),
+          start: toLocalIso(start),
+          end: toLocalIso(end),
         }),
       );
     }),
+    route("GET", "/api/lessons/home", true, (ctx) =>
+      service.getHomeLessons(a(ctx)),
+    ),
     route("GET", "/api/lessons/upcoming", true, (ctx) => {
       return service.getUpcomingLessons(a(ctx), q(ctx));
     }),
@@ -262,6 +276,19 @@ function buildRoutes(service: AppService): Route[] {
     ),
     route("PATCH", "/api/lessons/:lessonId", true, (ctx) =>
       service.updateLesson(a(ctx), p(ctx, "lessonId"), ctx.body),
+    ),
+    route("POST", "/api/lessons/:lessonId/reschedule", true, (ctx) =>
+      service.createLessonChange(a(ctx), {
+        ...ctx.body,
+        lessonId: p(ctx, "lessonId"),
+        type: "reschedule",
+      }),
+    ),
+    route("POST", "/api/lessons/:lessonId/leave", true, (ctx) =>
+      service.requestLeave(a(ctx), {
+        ...ctx.body,
+        lessonId: p(ctx, "lessonId"),
+      }),
     ),
     route("DELETE", "/api/lessons/:lessonId", true, (ctx) =>
       service.deleteLesson(a(ctx), p(ctx, "lessonId")),
@@ -278,6 +305,9 @@ function buildRoutes(service: AppService): Route[] {
 
     route("POST", "/api/attendance/check-in", true, (ctx) =>
       service.checkIn(a(ctx), ctx.body),
+    ),
+    route("POST", "/api/lessons/backfill-check-in", true, (ctx) =>
+      service.checkIn(a(ctx), { ...ctx.body, type: "backdated" }),
     ),
     route("POST", "/api/attendance/lessons/:lessonId/cancel", true, (ctx) =>
       service.cancelCheckIn(a(ctx), p(ctx, "lessonId")),
@@ -301,6 +331,9 @@ function buildRoutes(service: AppService): Route[] {
       service.lessonChangeHistory(a(ctx), q(ctx)),
     ),
     route("POST", "/api/lesson-changes/:changeId/cancel", true, (ctx) =>
+      service.cancelLessonChange(a(ctx), p(ctx, "changeId")),
+    ),
+    route("POST", "/api/lesson-change-records/:changeId/revoke", true, (ctx) =>
       service.cancelLessonChange(a(ctx), p(ctx, "changeId")),
     ),
     route("POST", "/api/leaves", true, (ctx) =>

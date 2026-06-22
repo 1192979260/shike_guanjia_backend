@@ -50,7 +50,7 @@ DATABASE_URL=mysql://<username>:<password>@<internal-host>:<port>/<database>
 TOKEN_SECRET=<long-random-secret>
 ```
 
-The MySQL store uses normalized tables for core product data:
+The MySQL store uses normalized tables for product data:
 
 ```sql
 users
@@ -60,9 +60,17 @@ children
 classes
 lessons
 auth_credentials
+sessions
+attendance
+leaves
+lesson_changes
+suspensions
+reminder_settings
+reminder_subscriptions
+theme_preferences
 ```
 
-Less central or fast-changing data, such as sessions, attendance side records, leaves, preferences, and reminder settings, still uses `kv_store(collection, id, value)`. On startup, legacy core records are migrated from `kv_store` into empty normalized tables. During request handling, MySQL core tables are refreshed before auth and business logic so direct database repairs are visible without relying on stale in-process snapshots.
+On startup, legacy `kv_store(collection, id, value)` data is migrated into the dedicated MySQL tables and the legacy `kv_store` table is dropped. During request handling, MySQL tables are refreshed before auth and business logic so direct database repairs are visible without relying on stale in-process snapshots.
 
 CloudBase MySQL direct connection should use the internal address from the cloud hosting service. Use external addresses only for local debugging.
 
@@ -86,3 +94,8 @@ The smoke script logs in with the non-production code `123456`, creates a child 
 - [API reference](docs/api.md)
 - [Architecture notes](docs/architecture.md)
 - [OpenAPI JSON](docs/openapi.json)
+npm run build
+zip -r shike-guanjia-backend-wechat-cloud.zip \
+  Dockerfile .dockerignore package.json package-lock.json \
+  tsconfig.json tsconfig.build.json src README.md docs scripts \
+  -x '*.DS_Store' '*.zip' 'node_modules/*' '.data/*' '.codex/*'
