@@ -3,7 +3,7 @@
   "info": {
     "title": "课时管家 Backend API",
     "version": "0.1.0",
-    "description": "Flutter 端联调用后端 API。非生产环境验证码默认 123456。"
+    "description": "Flutter 端联调用后端 API。认证使用手机号和密码。"
   },
   "servers": [
     {
@@ -54,15 +54,21 @@
       }
     },
     "schemas": {
-      "SendCodeRequest": {
+      "RegisterRequest": {
         "type": "object",
         "required": [
-          "phone"
+          "phone",
+          "password"
         ],
         "properties": {
           "phone": {
             "type": "string",
             "example": "13800138000"
+          },
+          "password": {
+            "type": "string",
+            "minLength": 6,
+            "example": "password123"
           }
         }
       },
@@ -70,16 +76,16 @@
         "type": "object",
         "required": [
           "phone",
-          "code"
+          "password"
         ],
         "properties": {
           "phone": {
             "type": "string",
             "example": "13800138000"
           },
-          "code": {
+          "password": {
             "type": "string",
-            "example": "123456"
+            "example": "password123"
           }
         }
       },
@@ -601,12 +607,12 @@
         }
       }
     },
-    "/api/auth/send-code": {
+    "/api/auth/register": {
       "post": {
         "tags": [
           "Auth"
         ],
-        "summary": "发送验证码",
+        "summary": "手机号密码注册",
         "security": [],
         "parameters": [],
         "requestBody": {
@@ -614,7 +620,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SendCodeRequest"
+                "$ref": "#/components/schemas/RegisterRequest"
               }
             }
           }
@@ -668,7 +674,7 @@
         "tags": [
           "Auth"
         ],
-        "summary": "手机号验证码登录",
+        "summary": "手机号密码登录",
         "security": [],
         "parameters": [],
         "requestBody": {

@@ -11,7 +11,7 @@ import {
   findLessonConflicts,
   generateLessonsForClass,
 } from "../src/schedule.js";
-import { MemoryStore, SqliteStore } from "../src/store.js";
+import { FileStore, MemoryStore } from "../src/store.js";
 import type { RecurringRule } from "../src/types.js";
 
 let service: AppService;
@@ -159,11 +159,11 @@ describe("auth and family", { concurrency: false }, () => {
     });
   });
 
-  it("persists users, sessions, and children across sqlite restart", () => {
-    const dbPath = ".data/test-persistence.sqlite";
-    rmSync(dbPath, { force: true });
+  it("persists users, sessions, and children across file-store restart", () => {
+    const filePath = ".data/test-persistence.json";
+    rmSync(filePath, { force: true });
 
-    const firstStore = new SqliteStore(dbPath);
+    const firstStore = new FileStore(filePath);
     const firstService = new AppService(
       firstStore,
       loadConfig({ NODE_ENV: "test" }),
@@ -172,7 +172,7 @@ describe("auth and family", { concurrency: false }, () => {
     const firstAuth = firstService.authenticate(`Bearer ${login.token}`);
     const child = firstService.createChild(firstAuth, { name: "真实宝贝" });
 
-    const secondStore = new SqliteStore(dbPath);
+    const secondStore = new FileStore(filePath);
     const secondService = new AppService(
       secondStore,
       loadConfig({ NODE_ENV: "test" }),
@@ -181,14 +181,14 @@ describe("auth and family", { concurrency: false }, () => {
     assert.equal(secondAuth.user.phone, "13600136000");
     assert.equal(secondService.getChild(secondAuth, child.id).name, "真实宝贝");
 
-    rmSync(dbPath, { force: true });
+    rmSync(filePath, { force: true });
   });
 
-  it("persists reminder settings and theme preferences across sqlite restart", () => {
-    const dbPath = ".data/test-preferences.sqlite";
-    rmSync(dbPath, { force: true });
+  it("persists reminder settings and theme preferences across file-store restart", () => {
+    const filePath = ".data/test-preferences.json";
+    rmSync(filePath, { force: true });
 
-    const firstStore = new SqliteStore(dbPath);
+    const firstStore = new FileStore(filePath);
     const firstService = new AppService(
       firstStore,
       loadConfig({ NODE_ENV: "test" }),
@@ -202,7 +202,7 @@ describe("auth and family", { concurrency: false }, () => {
     });
     firstService.updateThemePreference(firstAuth, { skin: "classic" });
 
-    const secondStore = new SqliteStore(dbPath);
+    const secondStore = new FileStore(filePath);
     const secondService = new AppService(
       secondStore,
       loadConfig({ NODE_ENV: "test" }),
@@ -215,14 +215,14 @@ describe("auth and family", { concurrency: false }, () => {
     );
     assert.equal(secondService.getThemePreference(secondAuth).skin, "classic");
 
-    rmSync(dbPath, { force: true });
+    rmSync(filePath, { force: true });
   });
 
-  it("persists family member changes across sqlite restart", () => {
-    const dbPath = ".data/test-family-members.sqlite";
-    rmSync(dbPath, { force: true });
+  it("persists family member changes across file-store restart", () => {
+    const filePath = ".data/test-family-members.json";
+    rmSync(filePath, { force: true });
 
-    const firstStore = new SqliteStore(dbPath);
+    const firstStore = new FileStore(filePath);
     const firstService = new AppService(
       firstStore,
       loadConfig({ NODE_ENV: "test" }),
@@ -235,7 +235,7 @@ describe("auth and family", { concurrency: false }, () => {
       relation: "father",
     });
 
-    const secondStore = new SqliteStore(dbPath);
+    const secondStore = new FileStore(filePath);
     const secondService = new AppService(
       secondStore,
       loadConfig({ NODE_ENV: "test" }),
@@ -250,7 +250,7 @@ describe("auth and family", { concurrency: false }, () => {
 
     secondService.removeFamilyMember(secondAuth, member.id);
 
-    const thirdStore = new SqliteStore(dbPath);
+    const thirdStore = new FileStore(filePath);
     const thirdService = new AppService(
       thirdStore,
       loadConfig({ NODE_ENV: "test" }),
@@ -263,7 +263,7 @@ describe("auth and family", { concurrency: false }, () => {
       false,
     );
 
-    rmSync(dbPath, { force: true });
+    rmSync(filePath, { force: true });
   });
 
   it("returns default and partial-updated family reminder settings across member sessions", () => {
@@ -438,7 +438,7 @@ describe("auth and family", { concurrency: false }, () => {
 
     assert.equal(templateData.thing9.value, "学员");
     assert.equal(templateData.thing8.value, "篮球");
-    assert.equal(templateData.time15.value, "2026-06-23 09:00");
+    assert.equal(templateData.time15.value, "2026年06月18日 13:40");
   });
 
   it("returns default and updated user theme preference without sharing it across family members", () => {
@@ -535,7 +535,7 @@ describe("lesson flow contract", { concurrency: false }, () => {
     }
   });
 
-  it("does not deduct hours on leave until the makeup lesson is checked in", () => {
+  it("does not deduct hours when a leave change moves the original lesson", () => {
     const restoreNow = mockNow("2026-06-15T08:00:00.000");
     try {
       const child = service.createChild(auth, { name: "小宝" });
@@ -550,7 +550,7 @@ describe("lesson flow contract", { concurrency: false }, () => {
         recurringRule: rule,
       });
       const originalLesson = service.getClassLessons(auth, trainingClass.id)[0]!;
-      const leave = service.requestLeave(auth, {
+      service.requestLeave(auth, {
         lessonId: originalLesson.id,
         reason: "孩子请假",
         scheduledDate: "2026-06-20T09:00:00.000",
@@ -559,18 +559,22 @@ describe("lesson flow contract", { concurrency: false }, () => {
       const afterLeaveClass = service.getClass(auth, trainingClass.id);
       assert.equal(afterLeaveClass.usedHours, 0);
       assert.equal(afterLeaveClass.remainingHours, 2);
+      assert.equal(service.getClassLessons(auth, trainingClass.id).length, 2);
+      assert.equal(
+        service.getLesson(auth, originalLesson.id).scheduledDate,
+        "2026-06-20T09:00:00.000",
+      );
 
-      const makeupLesson = service.getLesson(auth, leave.makeupLessonId!);
       const checkinRestoreNow = mockNow("2026-06-20T09:10:00.000");
       try {
-        service.checkIn(auth, { lessonId: makeupLesson.id });
+        service.checkIn(auth, { lessonId: originalLesson.id });
       } finally {
         checkinRestoreNow();
       }
 
-      const afterMakeupClass = service.getClass(auth, trainingClass.id);
-      assert.equal(afterMakeupClass.usedHours, 1);
-      assert.equal(afterMakeupClass.remainingHours, 1);
+      const afterCheckinClass = service.getClass(auth, trainingClass.id);
+      assert.equal(afterCheckinClass.usedHours, 1);
+      assert.equal(afterCheckinClass.remainingHours, 1);
     } finally {
       restoreNow();
     }
@@ -790,6 +794,57 @@ describe("children, classes, lessons", { concurrency: false }, () => {
           .length < upcoming.length,
         true,
       );
+    } finally {
+      restoreNow();
+    }
+  });
+
+  it("keeps a changed lesson on the same id in home and upcoming lists", () => {
+    const restoreNow = mockNow("2026-06-16T09:10:00.000");
+    try {
+      const child = service.createChild(auth, { name: "小宝" });
+      const trainingClass = service.createClass(auth, {
+        childId: child.id,
+        institutionName: "星星美术",
+        className: "大班A",
+        courseName: "美术启蒙",
+        totalHours: 4,
+        totalFee: 400,
+        startTime: "2026-06-16T09:00:00.000",
+        recurringRule: {
+          type: "weekly",
+          daysOfWeek: [1, 2, 3],
+          timeSlots: [
+            { dayOfWeek: 1, startHour: 9, startMinute: 0, endHour: 10, endMinute: 0 },
+            { dayOfWeek: 2, startHour: 9, startMinute: 0, endHour: 10, endMinute: 0 },
+            { dayOfWeek: 3, startHour: 9, startMinute: 0, endHour: 10, endMinute: 0 },
+          ],
+        },
+      });
+      const [todayLesson, tomorrowLesson] = service.getClassLessons(auth, trainingClass.id);
+      assert.ok(todayLesson);
+      assert.ok(tomorrowLesson);
+
+      const lessonCount = service.getClassLessons(auth, trainingClass.id).length;
+      service.createLessonChange(auth, {
+        lessonId: todayLesson.id,
+        type: "reschedule",
+        source: "teacher",
+        reason: "老师临时有事",
+        newScheduledDate: "2026-06-16T11:00:00.000",
+        newScheduledEndDate: "2026-06-16T12:00:00.000",
+      });
+
+      const home = service.getHomeLessons(auth);
+      const upcoming = service.getUpcomingLessons(auth, new URLSearchParams({ days: "3" }));
+
+      assert.equal(service.getClassLessons(auth, trainingClass.id).length, lessonCount);
+      assert.equal(home.todayLessons.some((item) => item.id === todayLesson.id), true);
+      assert.equal(
+        home.todayLessons.find((item) => item.id === todayLesson.id)?.scheduledDate,
+        "2026-06-16T11:00:00.000",
+      );
+      assert.equal(upcoming.some((item) => item.id === tomorrowLesson.id), true);
     } finally {
       restoreNow();
     }
@@ -1259,6 +1314,7 @@ describe("attendance, leave, cost", { concurrency: false }, () => {
       recurringRule: rule,
     });
     const lessons = service.getClassLessons(auth, trainingClass.id);
+    const lessonCount = lessons.length;
     const leaveChange = service.createLessonChange(auth, {
       lessonId: lessons[0]!.id,
       type: "leave",
@@ -1267,10 +1323,11 @@ describe("attendance, leave, cost", { concurrency: false }, () => {
       newScheduledDate: "2026-07-01T10:00:00.000",
       newScheduledEndDate: "2026-07-01T11:30:00.000",
     });
-    assert.equal(service.getLesson(auth, lessons[0]!.id).status, "leave");
-    assert.equal(service.getLesson(auth, leaveChange.newLessonId!).status, "scheduled");
+    assert.equal(service.getClassLessons(auth, trainingClass.id).length, lessonCount);
+    assert.equal(service.getLesson(auth, lessons[0]!.id).status, "scheduled");
+    assert.equal(leaveChange.newLessonId, null);
     assert.equal(
-      service.getLesson(auth, leaveChange.newLessonId!).scheduledEndDate,
+      service.getLesson(auth, lessons[0]!.id).scheduledEndDate,
       "2026-07-01T11:30:00.000",
     );
     const rescheduleChange = service.createLessonChange(auth, {
@@ -1280,14 +1337,97 @@ describe("attendance, leave, cost", { concurrency: false }, () => {
       reason: "老师临时有事",
       newScheduledDate: "2026-07-02T10:00:00.000",
     });
-    assert.equal(service.getLesson(auth, lessons[1]!.id).status, "rescheduled");
+    assert.equal(service.getClassLessons(auth, trainingClass.id).length, lessonCount);
+    assert.equal(service.getLesson(auth, lessons[1]!.id).status, "scheduled");
+    assert.equal(service.getLesson(auth, lessons[1]!.id).scheduledDate, "2026-07-02T10:00:00.000");
     assert.equal(service.lessonChangeHistory(auth, new URLSearchParams()).length, 2);
     service.cancelLessonChange(auth, rescheduleChange.id);
     assert.equal(service.getLesson(auth, lessons[1]!.id).status, "scheduled");
-    assert.throws(() => service.getLesson(auth, rescheduleChange.newLessonId!), /not found/i);
+    assert.equal(service.getLesson(auth, lessons[1]!.id).scheduledDate, lessons[1]!.scheduledDate);
   });
 
-  it("does not cancel a lesson change after replacement is completed", () => {
+  it("rejects lesson changes that conflict with another lesson but ignores itself", () => {
+    const restoreNow = mockNow("2026-06-15T08:00:00.000");
+    try {
+      const child = service.createChild(auth, { name: "小宝" });
+      const trainingClass = service.createClass(auth, {
+        childId: child.id,
+        institutionName: "星星美术",
+        className: "大班A",
+        courseName: "美术启蒙",
+        totalHours: 3,
+        totalFee: 300,
+        startTime: "2026-06-15T09:00:00.000",
+        recurringRule: rule,
+      });
+      const lessons = service.getClassLessons(auth, trainingClass.id);
+
+      const noOpChange = service.createLessonChange(auth, {
+        lessonId: lessons[0]!.id,
+        type: "reschedule",
+        source: "teacher",
+        newScheduledDate: lessons[0]!.scheduledDate,
+        newScheduledEndDate: lessons[0]!.scheduledEndDate,
+      });
+      assert.equal(noOpChange.lessonId, lessons[0]!.id);
+
+      assert.throws(
+        () =>
+          service.createLessonChange(auth, {
+            lessonId: lessons[0]!.id,
+            type: "reschedule",
+            source: "teacher",
+            newScheduledDate: lessons[1]!.scheduledDate,
+            newScheduledEndDate: lessons[1]!.scheduledEndDate,
+          }),
+        /conflicts/,
+      );
+    } finally {
+      restoreNow();
+    }
+  });
+
+  it("updates pending lesson reminders when a lesson change moves the original lesson", async () => {
+    const restoreNow = mockNow("2026-06-15T08:00:00.000");
+    try {
+      await service.bindWeChatSession(auth, { openid: "openid-reminder-change" });
+      const child = service.createChild(auth, { name: "小宝" });
+      const trainingClass = service.createClass(auth, {
+        childId: child.id,
+        institutionName: "星星美术",
+        className: "大班A",
+        courseName: "美术启蒙",
+        totalHours: 2,
+        totalFee: 200,
+        startTime: "2026-06-22T09:00:00.000",
+        recurringRule: rule,
+      });
+      const lesson = service.getClassLessons(auth, trainingClass.id)[0]!;
+      service.registerLessonReminders(auth, {
+        lessonIds: [lesson.id],
+        advanceMinutes: 60,
+      });
+      const subscription = [...store.reminderSubscriptions.values()].find(
+        (item) => item.lessonId === lesson.id,
+      )!;
+
+      service.createLessonChange(auth, {
+        lessonId: lesson.id,
+        type: "reschedule",
+        source: "teacher",
+        newScheduledDate: "2026-06-23T10:00:00.000",
+        newScheduledEndDate: "2026-06-23T11:00:00.000",
+      });
+
+      const updated = store.reminderSubscriptions.get(subscription.id)!;
+      assert.equal(updated.scheduledAt, "2026-06-23T10:00:00.000");
+      assert.equal(updated.remindAt, "2026-06-23T09:00:00.000");
+    } finally {
+      restoreNow();
+    }
+  });
+
+  it("does not cancel a lesson change after the changed lesson is completed", () => {
     const child = service.createChild(auth, { name: "小宝" });
     const trainingClass = service.createClass(auth, {
       childId: child.id,
@@ -1308,7 +1448,7 @@ describe("attendance, leave, cost", { concurrency: false }, () => {
     });
     const restoreNow = mockNow("2026-07-03T10:05:00.000");
     try {
-      service.checkIn(auth, { lessonId: change.newLessonId, type: "checkin" });
+      service.checkIn(auth, { lessonId: lesson.id, type: "checkin" });
       assert.throws(
         () => service.cancelLessonChange(auth, change.id),
         /Cannot cancel change/,
@@ -1319,7 +1459,7 @@ describe("attendance, leave, cost", { concurrency: false }, () => {
   });
 
 
-  it("requests and cancels leave with makeup lesson", () => {
+  it("requests leave by moving the original lesson", () => {
     const child = service.createChild(auth, { name: "小宝" });
     const trainingClass = service.createClass(auth, {
       childId: child.id,
@@ -1332,18 +1472,22 @@ describe("attendance, leave, cost", { concurrency: false }, () => {
       recurringRule: rule,
     });
     const lesson = service.getClassLessons(auth, trainingClass.id)[0]!;
-    const leave = service.requestLeave(auth, {
+    const change = service.requestLeave(auth, {
       lessonId: lesson.id,
       reason: "生病",
+      scheduledDate: "2026-07-17T10:00:00.000",
+      scheduledEndDate: "2026-07-17T11:00:00.000",
     });
-    assert.equal(service.getLesson(auth, lesson.id).status, "leave");
-    assert.equal(service.makeupLessons(auth).length, 1);
-    service.cancelLeave(auth, leave.id);
+    assert.equal(change.type, "leave");
     assert.equal(service.getLesson(auth, lesson.id).status, "scheduled");
+    assert.equal(service.getLesson(auth, lesson.id).scheduledDate, "2026-07-17T10:00:00.000");
     assert.equal(service.makeupLessons(auth).length, 0);
+    service.cancelLessonChange(auth, change.id);
+    assert.equal(service.getLesson(auth, lesson.id).status, "scheduled");
+    assert.equal(service.getLesson(auth, lesson.id).scheduledDate, lesson.scheduledDate);
   });
 
-  it("does not delete a completed makeup lesson when cancelling leave", () => {
+  it("rejects cancelling a leave change after the changed lesson is completed", () => {
     const restoreNow = mockNow("2026-06-29T08:45:00.000");
     try {
       const child = service.createChild(auth, { name: "小宝" });
@@ -1361,17 +1505,18 @@ describe("attendance, leave, cost", { concurrency: false }, () => {
         service.getClassLessons(auth, trainingClass.id),
         "2026-06-22",
       );
-      const leave = service.requestLeave(auth, {
+      const change = service.requestLeave(auth, {
         lessonId: lesson.id,
         reason: "生病",
+        scheduledDate: "2026-06-29T09:00:00.000",
+        scheduledEndDate: "2026-06-29T10:00:00.000",
       });
-      const makeup = service.makeupLessons(auth)[0]!;
-      service.checkIn(auth, { lessonId: makeup.id, type: "checkin" });
+      service.checkIn(auth, { lessonId: lesson.id, type: "checkin" });
       assert.throws(
-        () => service.cancelLeave(auth, leave.id),
-        /Cannot cancel leave/,
+        () => service.cancelLessonChange(auth, change.id),
+        /Cannot cancel change/,
       );
-      assert.equal(service.getLesson(auth, makeup.id).status, "completed");
+      assert.equal(service.getLesson(auth, lesson.id).status, "completed");
     } finally {
       restoreNow();
     }

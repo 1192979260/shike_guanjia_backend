@@ -17,13 +17,12 @@ ARG NPM_CONFIG_REGISTRY
 
 ENV NODE_ENV=production \
     PORT=3000 \
-    STORAGE_MODE=sqlite \
-    SQLITE_FILE=/data/shike-guanjia.sqlite
+    STORAGE_MODE=mysql
 
 COPY package.json package-lock.json ./
 COPY --from=build /app/dist ./dist
 
-RUN npm ci --omit=dev && mkdir -p /data
+RUN npm ci --omit=dev
 
 EXPOSE 3000
 

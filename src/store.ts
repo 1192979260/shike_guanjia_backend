@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { createPool, type Pool, type RowDataPacket } from "mysql2/promise";
 import type { BackendRepositories } from "./repositories.js";
 import { normalizeDateString } from "./date-time.js";
@@ -98,6 +97,7 @@ export class FileStore extends MemoryStore {
   constructor(private filePath: string) {
     super();
     this.load();
+    this.wrapMaps();
   }
 
   override id() {
@@ -122,65 +122,47 @@ export class FileStore extends MemoryStore {
       const snapshot = JSON.parse(
         readFileSync(this.filePath, "utf8"),
       ) as Partial<StoreSnapshot>;
-      this.users = new PersistedMap(
-        snapshot.users?.map((item) => [item.id, item]) ?? [],
-        () => this.persist(),
-      );
-      this.families = new PersistedMap(
-        snapshot.families?.map((item) => [item.id, item]) ?? [],
-        () => this.persist(),
-      );
-      this.children = new PersistedMap(
-        snapshot.children?.map((item) => [item.id, item]) ?? [],
-        () => this.persist(),
-      );
-      this.classes = new PersistedMap(
-        snapshot.classes?.map((item) => [item.id, item]) ?? [],
-        () => this.persist(),
-      );
-      this.lessons = new PersistedMap(
-        snapshot.lessons?.map((item) => [item.id, item]) ?? [],
-        () => this.persist(),
-      );
-      this.attendance = new PersistedMap(
-        snapshot.attendance?.map((item) => [item.id, item]) ?? [],
-        () => this.persist(),
-      );
-      this.leaves = new PersistedMap(
-        snapshot.leaves?.map((item) => [item.id, item]) ?? [],
-        () => this.persist(),
-      );
-      this.lessonChanges = new PersistedMap(
-        snapshot.lessonChanges?.map((item) => [item.id, item]) ?? [],
-        () => this.persist(),
-      );
-      this.sessions = new PersistedMap(
-        snapshot.sessions?.map((item) => [item.token, item]) ?? [],
-        () => this.persist(),
-      );
-      this.authCredentials = new PersistedMap(
-        snapshot.authCredentials?.map((item) => [item.phone, item]) ?? [],
-        () => this.persist(),
-      );
-      this.suspensions = new PersistedMap(
-        snapshot.suspensions?.map((item) => [item.id, item]) ?? [],
-        () => this.persist(),
-      );
-      this.reminderSettings = new PersistedMap(
-        snapshot.reminderSettings?.map((item) => [item.familyId, item]) ?? [],
-        () => this.persist(),
-      );
-      this.reminderSubscriptions = new PersistedMap(
-        snapshot.reminderSubscriptions?.map((item) => [item.id, item]) ?? [],
-        () => this.persist(),
-      );
-      this.themePreferences = new PersistedMap(
-        snapshot.themePreferences?.map((item) => [item.userId, item]) ?? [],
-        () => this.persist(),
-      );
+      this.users = new Map(snapshot.users?.map((item) => [item.id, item]) ?? []);
+      this.families = new Map(snapshot.families?.map((item) => [item.id, item]) ?? []);
+      this.children = new Map(snapshot.children?.map((item) => [item.id, item]) ?? []);
+      this.classes = new Map(snapshot.classes?.map((item) => [item.id, item]) ?? []);
+      this.lessons = new Map(snapshot.lessons?.map((item) => [item.id, item]) ?? []);
+      this.attendance = new Map(snapshot.attendance?.map((item) => [item.id, item]) ?? []);
+      this.leaves = new Map(snapshot.leaves?.map((item) => [item.id, item]) ?? []);
+      this.lessonChanges = new Map(snapshot.lessonChanges?.map((item) => [item.id, item]) ?? []);
+      this.sessions = new Map(snapshot.sessions?.map((item) => [item.token, item]) ?? []);
+      this.authCredentials = new Map(snapshot.authCredentials?.map((item) => [item.phone, item]) ?? []);
+      this.suspensions = new Map(snapshot.suspensions?.map((item) => [item.id, item]) ?? []);
+      this.reminderSettings = new Map(snapshot.reminderSettings?.map((item) => [item.familyId, item]) ?? []);
+      this.reminderSubscriptions = new Map(snapshot.reminderSubscriptions?.map((item) => [item.id, item]) ?? []);
+      this.themePreferences = new Map(snapshot.themePreferences?.map((item) => [item.userId, item]) ?? []);
     } finally {
       this.loading = false;
     }
+  }
+
+  private wrapMaps() {
+    this.users = this.persistedMap(this.users);
+    this.families = this.persistedMap(this.families);
+    this.children = this.persistedMap(this.children);
+    this.classes = this.persistedMap(this.classes);
+    this.lessons = this.persistedMap(this.lessons);
+    this.attendance = this.persistedMap(this.attendance);
+    this.leaves = this.persistedMap(this.leaves);
+    this.lessonChanges = this.persistedMap(this.lessonChanges);
+    this.sessions = this.persistedMap(this.sessions);
+    this.authCredentials = this.persistedMap(this.authCredentials);
+    this.suspensions = this.persistedMap(this.suspensions);
+    this.reminderSettings = this.persistedMap(this.reminderSettings);
+    this.reminderSubscriptions = this.persistedMap(this.reminderSubscriptions);
+    this.themePreferences = this.persistedMap(this.themePreferences);
+  }
+
+  private persistedMap<T>(source: Map<string, T>) {
+    return new PersistedMap<string, T>(
+      [...source.entries()],
+      () => this.persist(),
+    );
   }
 
   private snapshot(): StoreSnapshot {
@@ -241,166 +223,6 @@ class PersistedMap<K, V> extends Map<K, V> {
     if (this.size === 0) return;
     super.clear();
     this.onChange();
-  }
-}
-
-export class SqliteStore extends MemoryStore {
-  private db: DatabaseSync;
-  private loading = false;
-
-  constructor(private filePath: string) {
-    super();
-    mkdirSync(dirname(filePath), { recursive: true });
-    this.db = new DatabaseSync(filePath);
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS kv_store (
-        collection TEXT NOT NULL,
-        id TEXT NOT NULL,
-        value TEXT NOT NULL,
-        PRIMARY KEY (collection, id)
-      );
-    `);
-    this.loadCollection("users", this.users, (item: User) => item.id);
-    this.loadCollection("families", this.families, (item: Family) => item.id);
-    this.loadCollection("children", this.children, (item: Child) => item.id);
-    this.loadCollection(
-      "classes",
-      this.classes,
-      (item: TrainingClass) => item.id,
-    );
-    this.loadCollection("lessons", this.lessons, (item: Lesson) => item.id);
-    this.loadCollection(
-      "attendance",
-      this.attendance,
-      (item: Attendance) => item.id,
-    );
-    this.loadCollection("leaves", this.leaves, (item: LeaveRecord) => item.id);
-    this.loadCollection(
-      "lesson_changes",
-      this.lessonChanges,
-      (item: LessonChangeRecord) => item.id,
-    );
-    this.loadCollection(
-      "sessions",
-      this.sessions,
-      (item: Session) => item.token,
-    );
-    this.loadCollection(
-      "authCredentials",
-      this.authCredentials,
-      (item: AuthCredential) => item.phone,
-    );
-    this.loadCollection(
-      "suspensions",
-      this.suspensions,
-      (item: SuspensionPeriod) => item.id,
-    );
-    this.loadCollection(
-      "reminderSettings",
-      this.reminderSettings,
-      (item: ReminderSettings) => item.familyId,
-    );
-    this.loadCollection(
-      "reminderSubscriptions",
-      this.reminderSubscriptions,
-      (item: LessonReminderSubscription) => item.id,
-    );
-    this.loadCollection(
-      "themePreferences",
-      this.themePreferences,
-      (item: ThemePreference) => item.userId,
-    );
-    this.wrapMaps();
-  }
-
-  override reset() {
-    super.reset();
-    this.db.exec("DELETE FROM kv_store");
-  }
-
-  private loadCollection<T>(
-    collection: string,
-    target: Map<string, T>,
-    getId: (item: T) => string,
-  ) {
-    this.loading = true;
-    try {
-      const rows = this.db
-        .prepare("SELECT value FROM kv_store WHERE collection = ?")
-        .all(collection) as Array<{ value: string }>;
-      for (const row of rows) {
-        const item = normalizeStoredDates(JSON.parse(row.value)) as T;
-        target.set(getId(item), item);
-      }
-    } finally {
-      this.loading = false;
-    }
-  }
-
-  private wrapMaps() {
-    this.users = this.persistedMap("users", this.users);
-    this.families = this.persistedMap("families", this.families);
-    this.children = this.persistedMap("children", this.children);
-    this.classes = this.persistedMap("classes", this.classes);
-    this.lessons = this.persistedMap("lessons", this.lessons);
-    this.attendance = this.persistedMap("attendance", this.attendance);
-    this.leaves = this.persistedMap("leaves", this.leaves);
-    this.lessonChanges = this.persistedMap(
-      "lesson_changes",
-      this.lessonChanges,
-    );
-    this.sessions = this.persistedMap("sessions", this.sessions);
-    this.authCredentials = this.persistedMap(
-      "authCredentials",
-      this.authCredentials,
-    );
-    this.suspensions = this.persistedMap("suspensions", this.suspensions);
-    this.reminderSettings = this.persistedMap(
-      "reminderSettings",
-      this.reminderSettings,
-    );
-    this.reminderSubscriptions = this.persistedMap(
-      "reminderSubscriptions",
-      this.reminderSubscriptions,
-    );
-    this.themePreferences = this.persistedMap(
-      "themePreferences",
-      this.themePreferences,
-    );
-  }
-
-  private persistedMap<T>(collection: string, source: Map<string, T>) {
-    return new PersistedMap<string, T>(
-      [...source.entries()],
-      () => {
-        if (!this.loading) this.persistCollection(collection, source);
-      },
-      (key, value) => this.setRecord(collection, key, value),
-      (key) => this.deleteRecord(collection, key),
-    );
-  }
-
-  private persistCollection<T>(collection: string, source: Map<string, T>) {
-    const deleteStmt = this.db.prepare(
-      "DELETE FROM kv_store WHERE collection = ?",
-    );
-    deleteStmt.run(collection);
-    for (const [key, value] of source.entries())
-      this.setRecord(collection, key, value);
-  }
-
-  private setRecord<T>(collection: string, key: string, value: T) {
-    this.db
-      .prepare(
-        "INSERT OR REPLACE INTO kv_store (collection, id, value) VALUES (?, ?, ?)",
-      )
-      .run(collection, key, JSON.stringify(value));
-  }
-
-  private deleteRecord(collection: string, key: string) {
-    this.db
-      .prepare("DELETE FROM kv_store WHERE collection = ? AND id = ?")
-      .run(collection, key);
   }
 }
 

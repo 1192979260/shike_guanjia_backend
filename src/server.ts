@@ -2,7 +2,7 @@ import { AppService } from './app-service.js';
 import type { Config } from './config.js';
 import { loadConfig } from './config.js';
 import { createApp } from './http.js';
-import { FileStore, MemoryStore, MysqlStore, SqliteStore } from './store.js';
+import { FileStore, MemoryStore, MysqlStore } from './store.js';
 
 const config = loadConfig();
 const store = await createStore(config);
@@ -26,7 +26,6 @@ async function createStore(config: Config) {
     if (!config.databaseUrl) throw new Error('DATABASE_URL is required when STORAGE_MODE=mysql');
     return MysqlStore.create(config.databaseUrl);
   }
-  if (config.storageMode === 'sqlite') return new SqliteStore(config.sqliteFile);
   if (config.storageMode === 'file') return new FileStore(config.dataFile);
   return new MemoryStore();
 }

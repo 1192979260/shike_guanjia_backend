@@ -42,7 +42,16 @@ const trainingClass = await request('/api/classes', {
 });
 const lessons = await request(`/api/classes/${trainingClass.id}/lessons`, { token });
 await request('/api/attendance/check-in', { method: 'POST', token, body: { lessonId: lessons[0].id, type: 'checkin' } });
-const leave = await request('/api/leaves', { method: 'POST', token, body: { lessonId: lessons[1].id, reason: '生病' } });
+const leave = await request('/api/leaves', {
+  method: 'POST',
+  token,
+  body: {
+    lessonId: lessons[1].id,
+    reason: '生病',
+    scheduledDate: '2026-06-24T09:00:00.000',
+    scheduledEndDate: '2026-06-24T10:00:00.000',
+  },
+});
 const cost = await request('/api/cost/monthly?year=2026&month=6', { token });
 
 console.log(JSON.stringify({ user: login.user.phone, child: child.name, classId: trainingClass.id, lessonCount: lessons.length, leaveId: leave.id, totalCost: cost.totalCost }, null, 2));

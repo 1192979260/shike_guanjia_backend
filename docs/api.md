@@ -7,19 +7,17 @@
 - OpenAPI JSON: `http://localhost:3000/openapi.json`
 - Start dev server: `npm run dev`
 - Run checks: `npm test && npm run typecheck`
-- Default persistence: SQLite at `.data/shike-guanjia.sqlite`.
+- Default persistence: MySQL via `DATABASE_URL`.
 - Storage override: `STORAGE_MODE=mysql DATABASE_URL=mysql://...` for CloudBase Run / production MySQL, `STORAGE_MODE=memory` for ephemeral test data, or `STORAGE_MODE=file DATA_FILE=.data/shike-guanjia.json` for JSON-file storage. MySQL stores product records in dedicated tables and migrates legacy `kv_store` data on startup before dropping the legacy table.
-- SQLite file override: `SQLITE_FILE=.data/custom.sqlite`
 - Auth header: `Authorization: Bearer <token>`
 - JSON response envelope: successful JSON endpoints return `{ "data": ... }`; errors return `{ "error": { "code", "message", "fields" } }`.
-- Date fields use ISO-8601 strings. Payload field names and enum values intentionally match Flutter `domain/models` serialization.
-- Non-production verification code defaults to `123456` via `DEV_VERIFICATION_CODE`. `POST /api/auth/send-code` returns `devCode` outside production.
+- Date fields use ISO-8601 strings. Payload field names and enum values intentionally match app `domain/models` serialization.
 - `GET /health` is unauthenticated and returns `{ "data": { "ok": true } }`.
 
 ## Auth And Family
 
-- `POST /api/auth/send-code` body `{ "phone": "13800138000" }`
-- `POST /api/auth/login` body `{ "phone": "13800138000", "code": "123456" }` returns `{ token, user, family }`
+- `POST /api/auth/register` body `{ "phone": "13800138000", "password": "password123" }` returns `{ token, user, family }`
+- `POST /api/auth/login` body `{ "phone": "13800138000", "password": "password123" }` returns `{ token, user, family }`
 - `GET /api/auth/me`
 - `POST /api/auth/logout`
 - `GET /api/family`
@@ -144,6 +142,5 @@ Family sharing errors use stable `error.code` values for Flutter display:
 
 ## Productionization Gaps
 
-- Replace deterministic dev verification code with a production SMS provider adapter.
 - Add production migration/backup tooling around the current SQLite key-value store, or replace it with LeanCloud/database repositories.
 - Add push reminders, system calendar integration, avatar/file upload storage, and operational monitoring.

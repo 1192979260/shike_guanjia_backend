@@ -26,14 +26,13 @@ import {
   notFound,
   unauthorized,
 } from "./errors.js";
-import { generateLessonsForClass, nextLessonAfter } from "./schedule.js";
+import { generateLessonsForClass } from "./schedule.js";
 import { MemoryStore } from "./store.js";
 import type {
   Attendance,
   ClassCostBreakdown,
   CostTrendPoint,
   FamilyMember,
-  LeaveRecord,
   Lesson,
   LessonAttendanceStatus,
   LessonChangeRecord,
@@ -1006,15 +1005,7 @@ export class AppService {
 
   checkLessonConflicts(ctx: AuthContext, lessonId: string) {
     const lesson = this.requireLesson(ctx, lessonId);
-    const trainingClass = this.requireClass(ctx, lesson.classId);
-    return this.familyLessons(ctx).filter((candidate) => {
-      if (candidate.id === lesson.id) return false;
-      const candidateClass = this.store.classes.get(candidate.classId);
-      return (
-        candidateClass?.childId === trainingClass.childId &&
-        overlaps(lesson, candidate)
-      );
-    });
+    return this.findLessonTimeConflicts(ctx, lesson, new Set([lesson.id]));
   }
 
   checkIn(ctx: AuthContext, body: Record<string, unknown>) {
@@ -1247,23 +1238,16 @@ export class AppService {
       ? originalEnd.getTime() - originalStart.getTime()
       : 60 * 60 * 1000;
     const newEnd = requestedNewEnd ?? new Date(newStart.getTime() + duration);
-    const newLesson: Lesson = {
+    const movedLesson: Lesson = {
       ...lesson,
-      id: this.store.id(),
       scheduledDate: toLocalIso(newStart),
       scheduledEndDate: toLocalIso(newEnd),
       status: "scheduled",
-      sourceType: type === "leave" ? "manual_makeup" : "generated",
       attendanceStatus: "pending",
       changeStatus: "normal",
-      actualDate: null,
-      checkinTime: null,
-      isMakeup: type === "leave",
       leaveReason: null,
-      isManual: type === "leave",
-      originLessonId: lesson.id,
-      changeBatchId: null,
     };
+    this.assertNoLessonTimeConflict(ctx, movedLesson, new Set([lesson.id]));
     const change: LessonChangeRecord = {
       id: this.store.id(),
       lessonId: lesson.id,
@@ -1275,43 +1259,50 @@ export class AppService {
       description: optionalString(body.description) ?? null,
       originalStartAt: lesson.scheduledDate,
       originalEndAt: lesson.scheduledEndDate ?? null,
-      newScheduledDate: newLesson.scheduledDate,
-      newScheduledEndDate: newLesson.scheduledEndDate ?? null,
-      replacementLessonId: type === "reschedule" ? newLesson.id : null,
-      makeupLessonId: type === "leave" ? newLesson.id : null,
-      newLessonId: newLesson.id,
+      newScheduledDate: movedLesson.scheduledDate,
+      newScheduledEndDate: movedLesson.scheduledEndDate ?? null,
+      replacementLessonId: null,
+      makeupLessonId: null,
+      newLessonId: null,
       status: "active",
       createdAt: nowIso(),
     };
     this.store.lessonChanges.set(change.id, change);
-    this.store.lessons.set(lesson.id, {
-      ...lesson,
-      status: type === "leave" ? "leave" : "rescheduled",
-      attendanceStatus: "pending",
-      changeStatus: type === "leave" ? "leave" : "rescheduled",
-      leaveReason: change.reason,
-    });
-    this.store.lessons.set(newLesson.id, newLesson);
+    this.store.lessons.set(lesson.id, movedLesson);
+    this.syncPendingLessonReminderTimes(lesson.id, movedLesson.scheduledDate);
     return change;
   }
 
   cancelLessonChange(ctx: AuthContext, changeId: string) {
     const change = this.requireLessonChange(ctx, changeId);
+    const original = this.store.lessons.get(change.lessonId);
+    if (!original) throw notFound("Lesson not found");
+    if (this.lessonAttendanceStatus(original) === "checked_in")
+      throw badRequest("Cannot cancel change after lesson is completed");
+
     const linkedLessonId =
       change.replacementLessonId ?? change.makeupLessonId ?? change.newLessonId;
-    const newLesson = linkedLessonId ? this.store.lessons.get(linkedLessonId) : undefined;
-    if (newLesson?.status === "completed")
-      throw badRequest("Cannot cancel change after replacement lesson is completed");
-    this.store.lessonChanges.set(change.id, { ...change, status: "cancelled" });
-    const original = this.store.lessons.get(change.lessonId);
-    if (original)
-      this.store.lessons.set(original.id, {
+    const linkedLesson = linkedLessonId ? this.store.lessons.get(linkedLessonId) : undefined;
+    if (linkedLesson?.status === "completed")
+      throw badRequest("Cannot cancel change after linked lesson is completed");
+
+    const restoredLesson: Lesson = {
         ...original,
+        scheduledDate: change.originalStartAt,
+        scheduledEndDate: change.originalEndAt ?? original.scheduledEndDate ?? null,
         status: "scheduled",
+        attendanceStatus: "pending",
         changeStatus: "normal",
         leaveReason: null,
-      });
+    };
+    const excludedLessonIds = new Set([original.id]);
+    if (linkedLessonId) excludedLessonIds.add(linkedLessonId);
+    this.assertNoLessonTimeConflict(ctx, restoredLesson, excludedLessonIds);
+
+    this.store.lessonChanges.set(change.id, { ...change, status: "cancelled" });
+    this.store.lessons.set(original.id, restoredLesson);
     if (linkedLessonId) this.store.lessons.delete(linkedLessonId);
+    this.syncPendingLessonReminderTimes(original.id, restoredLesson.scheduledDate);
     return { success: true };
   }
 
@@ -1349,96 +1340,13 @@ export class AppService {
   }
 
   requestLeave(ctx: AuthContext, body: Record<string, unknown>) {
-    const lesson = this.requireLesson(
-      ctx,
-      assertString(body.lessonId, "lessonId"),
-    );
-    if (lesson.status === "completed")
-      throw badRequest("Cannot request leave for completed lesson");
-    if (!this.isLessonActionable(lesson))
-      throw badRequest("Only actionable lessons can request leave");
-    const trainingClass = this.requireClass(ctx, lesson.classId);
-    const requestedStart = body.scheduledDate
-      ? assertIsoDate(body.scheduledDate, "scheduledDate")
-      : null;
-    const requestedEnd = body.scheduledEndDate
-      ? assertIsoDate(body.scheduledEndDate, "scheduledEndDate")
-      : null;
-    const makeup = requestedStart
-      ? {
-          ...lesson,
-          id: this.store.id(),
-          scheduledDate: toLocalIso(requestedStart),
-          scheduledEndDate: toLocalIso(
-            requestedEnd ??
-              inferLessonEndDate(trainingClass, requestedStart) ??
-              new Date(requestedStart.getTime() + 60 * 60 * 1000),
-          ),
-          status: "scheduled" as const,
-          sourceType: "manual_makeup" as const,
-          attendanceStatus: "pending" as const,
-          changeStatus: "normal" as const,
-          actualDate: null,
-          checkinTime: null,
-          isMakeup: true,
-          notes: null,
-          leaveReason: null,
-          isManual: true,
-          originLessonId: lesson.id,
-          changeBatchId: null,
-        }
-      : nextLessonAfter(
-          trainingClass,
-          parseBusinessDateTime(lesson.scheduledDate, "scheduledDate"),
-          () => this.store.id(),
-        );
-    if (makeup) {
-      makeup.isMakeup = true;
-      makeup.sourceType = "manual_makeup";
-      makeup.attendanceStatus = "pending";
-      makeup.changeStatus = "normal";
-      makeup.originLessonId = lesson.id;
-      this.store.lessons.set(makeup.id, makeup);
-    }
-    const leave: LeaveRecord = {
-      id: this.store.id(),
-      lessonId: lesson.id,
-      classId: trainingClass.id,
-      childId: trainingClass.childId,
-      requestTime: nowIso(),
-      status: "approved",
-      reason: optionalString(body.reason) ?? null,
-      makeupLessonId: makeup?.id ?? null,
-      createdAt: nowIso(),
-    };
-    this.store.leaves.set(leave.id, leave);
-    this.store.lessons.set(lesson.id, {
-      ...lesson,
-      status: "leave",
-      changeStatus: "leave",
-      leaveReason: leave.reason,
-    });
-    const changeId = this.store.id();
-    this.store.lessonChanges.set(changeId, {
-      id: changeId,
-      lessonId: lesson.id,
-      classId: trainingClass.id,
-      childId: trainingClass.childId,
+    return this.createLessonChange(ctx, {
+      ...body,
+      newScheduledDate: body.newScheduledDate ?? body.scheduledDate,
+      newScheduledEndDate: body.newScheduledEndDate ?? body.scheduledEndDate,
       type: "leave",
       source: "student",
-      reason: leave.reason,
-      description: null,
-      originalStartAt: lesson.scheduledDate,
-      originalEndAt: lesson.scheduledEndDate ?? null,
-      newScheduledDate: makeup?.scheduledDate ?? null,
-      newScheduledEndDate: makeup?.scheduledEndDate ?? null,
-      makeupLessonId: makeup?.id ?? null,
-      replacementLessonId: null,
-      newLessonId: makeup?.id ?? null,
-      status: "active",
-      createdAt: nowIso(),
     });
-    return leave;
   }
 
   cancelLeave(ctx: AuthContext, leaveId: string) {
@@ -1716,6 +1624,52 @@ export class AppService {
     );
   }
 
+  private findLessonTimeConflicts(
+    ctx: AuthContext,
+    lesson: Lesson,
+    excludeLessonIds = new Set<string>(),
+  ) {
+    const trainingClass = this.requireClass(ctx, lesson.classId);
+    return this.familyLessons(ctx).filter((candidate) => {
+      if (excludeLessonIds.has(candidate.id)) return false;
+      if (!this.isLessonActionable(candidate)) return false;
+      const candidateClass = this.store.classes.get(candidate.classId);
+      return (
+        candidateClass?.childId === trainingClass.childId &&
+        overlaps(lesson, candidate)
+      );
+    });
+  }
+
+  private assertNoLessonTimeConflict(
+    ctx: AuthContext,
+    lesson: Lesson,
+    excludeLessonIds = new Set<string>(),
+  ) {
+    const conflicts = this.findLessonTimeConflicts(ctx, lesson, excludeLessonIds);
+    if (conflicts.length > 0) {
+      throw badRequest("Lesson time conflicts with another lesson", [
+        { field: "newScheduledDate", message: "该时间段已有课程，请选择其他时间" },
+      ]);
+    }
+  }
+
+  private syncPendingLessonReminderTimes(lessonId: string, scheduledAt: string) {
+    for (const subscription of [...this.store.reminderSubscriptions.values()]) {
+      if (subscription.lessonId !== lessonId || subscription.status !== "pending")
+        continue;
+      const remindAt = new Date(
+        businessTimestamp(scheduledAt) - subscription.advanceMinutes * 60_000,
+      );
+      this.store.reminderSubscriptions.set(subscription.id, {
+        ...subscription,
+        scheduledAt,
+        remindAt: toLocalIso(remindAt),
+        updatedAt: nowIso(),
+      });
+    }
+  }
+
   private lessonAttendanceStatus(lesson: Lesson): LessonAttendanceStatus {
     if (lesson.attendanceStatus) return lesson.attendanceStatus;
     if (lesson.status === "completed" || lesson.checkinTime || lesson.actualDate)
@@ -1739,6 +1693,7 @@ export class AppService {
   private isLessonActionable(lesson: Lesson) {
     return (
       this.lessonAttendanceStatus(lesson) !== "checked_in" &&
+      this.lessonChangeStatus(lesson) !== "rescheduled" &&
       this.lessonChangeStatus(lesson) !== "leave" &&
       this.lessonChangeStatus(lesson) !== "cancelled"
     );
