@@ -33,6 +33,8 @@ import type {
   Attendance,
   ClassCostBreakdown,
   CostTrendPoint,
+  Family,
+  FamilyRelation,
   FamilyMember,
   Lesson,
   LessonAttendanceStatus,
@@ -86,17 +88,36 @@ export class AppService {
     this.wechat = new WeChatClient(config);
   }
 
-  async register(phoneValue: unknown, passwordValue: unknown) {
+  async register(
+    phoneValue: unknown,
+    passwordValue: unknown,
+    relationValue?: unknown,
+  ) {
     const phone = assertPhone(phoneValue);
     const password = assertPassword(passwordValue);
     if (this.store.authCredentials.has(phone))
       throw badRequest("Phone already registered", [
         { field: "phone", message: "该手机号已注册" },
       ]);
-    const { user, family } = this.ensureUserAndFamily(phone);
+    const pendingMembership = this.findFamilyMembershipByPhone(phone);
+    const relation = pendingMembership?.member.relation ?? assertFamilyRelation(relationValue);
+    const { user, family } = this.ensureUserAndFamily(phone, relation);
     this.store.authCredentials.set(phone, await hashPassword(phone, password));
     const token = this.issueToken(user.id);
-    return { token, user, family };
+    return { token, user, family: this.presentFamily(family) };
+  }
+
+  getRegisterContext(phoneValue: unknown) {
+    const phone = assertPhone(phoneValue);
+    const pendingMembership = this.findFamilyMembershipByPhone(phone);
+    if (!pendingMembership || this.store.authCredentials.has(phone)) {
+      return { phone, invited: false };
+    }
+    return {
+      phone,
+      invited: true,
+      relation: pendingMembership.member.relation,
+    };
   }
 
   async login(phoneValue: unknown, passwordValue: unknown) {
@@ -115,7 +136,7 @@ export class AppService {
     if (!user) throw unauthorized("Invalid phone or password");
     const family = this.ensureFamily(user);
     const token = this.issueToken(user.id);
-    return { token, user, family };
+    return { token, user, family: this.presentFamily(family) };
   }
 
   private assertLoginAllowed(phone: string) {
@@ -147,7 +168,7 @@ export class AppService {
     this.loginAttempts.delete(phone);
   }
 
-  private ensureUserAndFamily(phone: string) {
+  private ensureUserAndFamily(phone: string, relation: FamilyRelation = "mother") {
     let user = [...this.store.users.values()].find(
       (item) => item.phone === phone,
     );
@@ -161,11 +182,50 @@ export class AppService {
       };
       this.store.users.set(user.id, user);
     }
-    const family = this.ensureFamily(user);
+    const family = this.ensureFamily(user, relation);
     return { user, family };
   }
 
-  private ensureFamily(user: User) {
+  private findFamilyMembershipByPhone(
+    phone: string,
+  ): { user: User; family: Family; member: FamilyMember } | undefined {
+    const user = [...this.store.users.values()].find(
+      (item) => item.phone === phone,
+    );
+    if (!user) return undefined;
+    return this.findFamilyMembershipByUserId(user.id);
+  }
+
+  private findFamilyMembershipByUserId(
+    userId: string,
+  ): { user: User; family: Family; member: FamilyMember } | undefined {
+    const user = this.store.users.get(userId);
+    if (!user) return undefined;
+    for (const family of this.store.families.values()) {
+      const member = family.members.find((item) => item.userId === user.id);
+      if (member) return { user, family, member };
+    }
+    return undefined;
+  }
+
+  private presentFamily(family: Family): Family {
+    return {
+      ...family,
+      members: family.members.map((member) => this.presentFamilyMember(member)),
+    };
+  }
+
+  private presentFamilyMember(member: FamilyMember): FamilyMember {
+    const user = this.store.users.get(member.userId);
+    const phone = user?.phone;
+    return {
+      ...member,
+      phone,
+      status: phone && this.store.authCredentials.has(phone) ? "active" : "pending",
+    };
+  }
+
+  private ensureFamily(user: User, relation: FamilyRelation = "mother") {
     let family = [...this.store.families.values()].find((item) =>
       item.members.some((member) => member.userId === user.id),
     );
@@ -173,7 +233,7 @@ export class AppService {
       const member: FamilyMember = {
         id: this.store.id(),
         userId: user.id,
-        relation: "mother",
+        relation,
         displayName: user.nickname ?? null,
         createdAt: nowIso(),
       };
@@ -225,7 +285,7 @@ export class AppService {
   }
 
   me(ctx: AuthContext) {
-    return { user: ctx.user, family: this.requireFamily(ctx.familyId) };
+    return { user: ctx.user, family: this.presentFamily(this.requireFamily(ctx.familyId)) };
   }
 
   logout(tokenHeader: string | undefined) {
@@ -237,16 +297,16 @@ export class AppService {
   }
 
   getFamily(ctx: AuthContext) {
-    return this.requireFamily(ctx.familyId);
+    return this.presentFamily(this.requireFamily(ctx.familyId));
   }
 
   getFamilyMembers(ctx: AuthContext) {
-    return this.requireFamily(ctx.familyId).members;
+    return this.presentFamily(this.requireFamily(ctx.familyId)).members;
   }
 
   addFamilyMember(ctx: AuthContext, body: Record<string, unknown>) {
     const phone = assertPhone(body.phone);
-    const relation = body.relation === "father" ? "father" : "mother";
+    const relation = assertFamilyRelation(body.relation);
     const family = this.requireFamily(ctx.familyId);
     let user = [...this.store.users.values()].find(
       (item) => item.phone === phone,
@@ -261,8 +321,16 @@ export class AppService {
       };
       this.store.users.set(user.id, user);
     }
-    if (family.members.some((member) => member.userId === user.id))
-      throw businessError("USER_ALREADY_IN_FAMILY", "User already in family");
+    const existingMembership = this.findFamilyMembershipByUserId(user.id);
+    if (existingMembership) {
+      if (existingMembership.family.id === family.id) {
+        throw businessError("USER_ALREADY_IN_FAMILY", "User already in family");
+      }
+      throw businessError(
+        "USER_ALREADY_IN_OTHER_FAMILY",
+        "User already belongs to another family",
+      );
+    }
     if (family.members.length >= 2)
       throw businessError(
         "FAMILY_MEMBER_LIMIT_REACHED",
@@ -279,7 +347,7 @@ export class AppService {
       ...family,
       members: [...family.members, member],
     });
-    return member;
+    return this.presentFamilyMember(member);
   }
 
   removeFamilyMember(ctx: AuthContext, memberId: string) {
@@ -536,6 +604,8 @@ export class AppService {
     const child = {
       id: this.store.id(),
       name: input.name,
+      gender: input.gender ?? null,
+      color: input.color ?? null,
       age: input.age ?? null,
       avatarUrl: input.avatarUrl ?? null,
       familyId: ctx.familyId,
@@ -556,6 +626,8 @@ export class AppService {
     const updated = {
       ...child,
       name: input.name,
+      gender: input.gender ?? null,
+      color: input.color ?? null,
       age: input.age ?? null,
       avatarUrl: input.avatarUrl ?? null,
     };
@@ -620,6 +692,7 @@ export class AppService {
       ),
       className: assertString(body.className, "className", "班级名称"),
       courseName: assertString(body.courseName, "courseName", "课程名称"),
+      icon: optionalString(body.icon) ?? null,
       teacherName: optionalString(body.teacherName) ?? null,
       teacherPhone: optionalString(body.teacherPhone) ?? null,
       totalHours,
@@ -660,6 +733,10 @@ export class AppService {
         body.courseName === undefined
           ? current.courseName
           : assertString(body.courseName, "courseName"),
+      icon:
+        body.icon === undefined
+          ? current.icon ?? null
+          : (optionalString(body.icon) ?? null),
       teacherName:
         body.teacherName === undefined
           ? current.teacherName
@@ -2027,6 +2104,9 @@ function assertClassStatus(value: unknown): TrainingClass["status"] {
   throw badRequest("Invalid class status");
 }
 
+function assertFamilyRelation(value: unknown): FamilyRelation {
+  return value === "father" ? "father" : "mother";
+}
 
 function assertLessonChangeType(value: unknown): LessonChangeType {
   const allowed = ["leave", "reschedule"] as const;

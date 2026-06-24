@@ -15,6 +15,9 @@ export interface Config {
   loginLockoutMs: number;
   loginAttemptWindowMs: number;
   maxBodyBytes: number;
+  uploadDir: string;
+  maxImageUploadBytes: number;
+  publicBaseUrl: string | null;
 }
 
 const DEFAULT_TOKEN_SECRET = "dev-secret-change-me";
@@ -34,6 +37,12 @@ function parseOrigins(env: NodeJS.ProcessEnv): string[] {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function parsePublicBaseUrl(env: NodeJS.ProcessEnv): string | null {
+  const raw = env.PUBLIC_BASE_URL?.trim();
+  if (!raw) return null;
+  return raw.replace(/\/+$/, "");
 }
 
 export function loadConfig(env = process.env): Config {
@@ -61,6 +70,9 @@ export function loadConfig(env = process.env): Config {
     loginLockoutMs: parseNumber(env, "LOGIN_LOCKOUT_MS", 15 * 60 * 1000),
     loginAttemptWindowMs: parseNumber(env, "LOGIN_ATTEMPT_WINDOW_MS", 15 * 60 * 1000),
     maxBodyBytes: parseNumber(env, "MAX_BODY_BYTES", 1024 * 1024),
+    uploadDir: env.UPLOAD_DIR ?? ".data/uploads",
+    maxImageUploadBytes: parseNumber(env, "MAX_IMAGE_UPLOAD_BYTES", 512 * 1024),
+    publicBaseUrl: parsePublicBaseUrl(env),
   };
 }
 

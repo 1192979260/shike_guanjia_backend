@@ -1,8 +1,9 @@
 import { parseBusinessDateTime } from "./date-time.js";
 import { badRequest } from './errors.js';
-import type { LessonTimeSlot, RecurringRule, ThemeSkin } from './types.js';
+import type { ChildColor, ChildGender, LessonTimeSlot, RecurringRule, ThemeSkin } from './types.js';
 
 const REMINDER_ADVANCE_MINUTES = new Set([15, 30, 60, 120, 1440]);
+const CHILD_COLORS = new Set<ChildColor>(['#BE6B45', '#C49A42', '#91A185', '#6F7F62', '#9B8170', '#8A7A68']);
 
 export function assertPhone(phone: unknown): string {
   if (typeof phone !== 'string' || !/^\+?\d{10,15}$/.test(phone)) {
@@ -41,7 +42,27 @@ export function assertChildInput(input: Record<string, unknown>) {
   if (age !== undefined && age !== null && (!Number.isInteger(age) || Number(age) < 0 || Number(age) > 18)) {
     throw badRequest('Validation failed', [{ field: 'age', message: '年龄必须在0到18之间' }]);
   }
-  return { name, age: age === undefined ? undefined : Number(age), avatarUrl: optionalString(input.avatarUrl) };
+  return {
+    name,
+    gender: optionalChildGender(input.gender),
+    color: optionalChildColor(input.color),
+    age: age === undefined ? undefined : Number(age),
+    avatarUrl: optionalString(input.avatarUrl),
+  };
+}
+
+function optionalChildGender(value: unknown): ChildGender | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (value === 'male' || value === 'female') return value;
+  throw badRequest('Validation failed', [{ field: 'gender', message: '性别只能是male或female' }]);
+}
+
+function optionalChildColor(value: unknown): ChildColor | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value === 'string' && CHILD_COLORS.has(value as ChildColor)) return value as ChildColor;
+  throw badRequest('Validation failed', [{ field: 'color', message: '请选择有效的宝贝颜色' }]);
 }
 
 export function assertIsoDate(value: unknown, field: string): Date {

@@ -94,6 +94,36 @@ describe("auth and family", { concurrency: false }, () => {
     assert.equal(me.family.members[0]?.relation, "mother");
   });
 
+  it("uses the requested relation for a newly registered family owner", async () => {
+    const login = await service.register("13800138009", "password123", "father");
+    const me = service.me(service.authenticate(`Bearer ${login.token}`));
+    assert.equal(me.family.members.length, 1);
+    assert.equal(me.family.members[0]?.relation, "father");
+  });
+
+  it("forces the invited member relation during registration", async () => {
+    const invited = service.addFamilyMember(auth, { phone: "13900139000", relation: "father" });
+    assert.equal(invited.phone, "13900139000");
+    assert.equal(invited.status, "pending");
+
+    assert.deepEqual(service.getRegisterContext("13900139000"), {
+      phone: "13900139000",
+      invited: true,
+      relation: "father",
+    });
+
+    const memberLogin = await service.register("13900139000", "password123", "mother");
+    const memberAuth = service.authenticate(`Bearer ${memberLogin.token}`);
+    const member = service
+      .getFamily(memberAuth)
+      .members.find((item) => item.userId === memberAuth.user.id);
+
+    assert.equal(memberAuth.familyId, auth.familyId);
+    assert.equal(member?.relation, "father");
+    assert.equal(member?.phone, "13900139000");
+    assert.equal(member?.status, "active");
+  });
+
   it("logs in with password and rejects duplicate registration or wrong password", async () => {
     const login = await service.login("13800138000", "password123");
     assert.equal(
@@ -109,7 +139,8 @@ describe("auth and family", { concurrency: false }, () => {
   });
 
   it("enforces member limit and last member protection", () => {
-    service.addFamilyMember(auth, { phone: "13900139000", relation: "father" });
+    const invited = service.addFamilyMember(auth, { phone: "13900139000", relation: "father" });
+    assert.equal(invited.status, "pending");
     assert.throws(
       () =>
         service.addFamilyMember(auth, {
@@ -120,9 +151,36 @@ describe("auth and family", { concurrency: false }, () => {
     );
     const family = service.getFamily(auth);
     service.removeFamilyMember(auth, family.members[1]!.id);
+    assert.equal(
+      service.getFamilyMembers(auth).some((item) => item.id === invited.id),
+      false,
+    );
     assert.throws(
       () => service.removeFamilyMember(auth, family.members[0]!.id),
       { code: "CANNOT_REMOVE_LAST_MEMBER" },
+    );
+  });
+
+  it("rejects adding a phone that already belongs to another family", async () => {
+    service.addFamilyMember(auth, { phone: "13900139000", relation: "father" });
+    const otherLogin = await service.register("13700137000", "password123", "mother");
+    const otherAuth = service.authenticate(`Bearer ${otherLogin.token}`);
+
+    assert.throws(
+      () =>
+        service.addFamilyMember(otherAuth, {
+          phone: "13900139000",
+          relation: "father",
+        }),
+      { code: "USER_ALREADY_IN_OTHER_FAMILY" },
+    );
+    assert.throws(
+      () =>
+        service.addFamilyMember(otherAuth, {
+          phone: "13800138000",
+          relation: "mother",
+        }),
+      { code: "USER_ALREADY_IN_OTHER_FAMILY" },
     );
   });
 
@@ -583,7 +641,12 @@ describe("lesson flow contract", { concurrency: false }, () => {
 
 describe("children, classes, lessons", { concurrency: false }, () => {
   it("creates child, class, and generated lessons", () => {
-    const child = service.createChild(auth, { name: "小宝", age: 6 });
+    const child = service.createChild(auth, { name: "小宝", gender: "female", color: "#BE6B45", age: 6 });
+    assert.equal(child.gender, "female");
+    assert.equal(child.color, "#BE6B45");
+    const updatedChild = service.updateChild(auth, child.id, { gender: "male", color: "#91A185" });
+    assert.equal(updatedChild.gender, "male");
+    assert.equal(updatedChild.color, "#91A185");
     const trainingClass = service.createClass(auth, {
       childId: child.id,
       institutionName: "星星美术",
@@ -597,6 +660,20 @@ describe("children, classes, lessons", { concurrency: false }, () => {
     const lessons = service.getClassLessons(auth, trainingClass.id);
     assert.equal(lessons.length, 4);
     assert.equal(lessons[0]?.status, "scheduled");
+  });
+
+  it("rejects invalid child gender", () => {
+    assert.throws(
+      () => service.createChild(auth, { name: "小宝", gender: "other" }),
+      /Validation failed/,
+    );
+  });
+
+  it("rejects invalid child color", () => {
+    assert.throws(
+      () => service.createChild(auth, { name: "小宝", color: "#FFFFFF" }),
+      /Validation failed/,
+    );
   });
 
   it("supports quick backfill of historical used hours without monthly cost", () => {

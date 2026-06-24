@@ -3,7 +3,7 @@ export const openApiSpec = {
   info: {
     title: "课时管家 Backend API",
     version: "0.1.0",
-    description: "Flutter 端联调用后端 API。认证使用手机号和密码。",
+    description: "Flutter / 小程序端联调用后端 API。用户登录以手机号密码为主。",
   },
   servers: [{ url: "http://localhost:3000", description: "Local dev server" }],
   tags: [
@@ -31,6 +31,27 @@ export const openApiSpec = {
         properties: {
           phone: { type: "string", example: "13800138000" },
           password: { type: "string", minLength: 6, example: "password123" },
+          relation: {
+            type: "string",
+            enum: ["mother", "father"],
+            default: "mother",
+            example: "mother",
+            description: "注册用户在新家庭中的角色。未传时默认 mother。",
+          },
+        },
+      },
+      RegisterContext: {
+        type: "object",
+        required: ["phone", "invited"],
+        properties: {
+          phone: { type: "string", example: "13900139000" },
+          invited: { type: "boolean", example: true },
+          relation: {
+            type: "string",
+            enum: ["mother", "father"],
+            example: "father",
+            description: "当 invited=true 时返回，注册时服务端会强制使用该角色。",
+          },
         },
       },
       LoginRequest: {
@@ -56,6 +77,8 @@ export const openApiSpec = {
         required: ["name"],
         properties: {
           name: { type: "string", example: "小宝" },
+          gender: { type: "string", enum: ["male", "female"], nullable: true, example: "female" },
+          color: { type: "string", enum: ["#BE6B45", "#C49A42", "#91A185", "#6F7F62", "#9B8170", "#8A7A68"], nullable: true, example: "#BE6B45" },
           age: { type: "integer", example: 6 },
           avatarUrl: { type: "string", nullable: true },
         },
@@ -184,6 +207,7 @@ export const openApiSpec = {
           institutionName: { type: "string", example: "星星美术" },
           className: { type: "string", example: "大班A" },
           courseName: { type: "string", example: "美术启蒙" },
+          icon: { type: "string", nullable: true, example: "palette" },
           teacherName: { type: "string", nullable: true, example: "王老师" },
           teacherPhone: {
             type: "string",
@@ -364,6 +388,16 @@ export const openApiSpec = {
     "/api/auth/register": {
       post: operation("Auth", "手机号密码注册", false, "RegisterRequest"),
     },
+    "/api/auth/register-context": {
+      get: operation("Auth", "查询手机号注册上下文", false, undefined, [
+        {
+          name: "phone",
+          in: "query",
+          required: true,
+          schema: { type: "string" },
+        },
+      ]),
+    },
     "/api/auth/login": {
       post: operation("Auth", "手机号密码登录", false, "LoginRequest"),
     },
@@ -418,7 +452,6 @@ export const openApiSpec = {
         "ThemePreferenceUpdateRequest",
       ),
     },
-
     "/api/children": {
       get: operation("Children", "孩子列表", true, undefined, queryParams(["page", "pageSize"])),
       post: operation("Children", "创建孩子", true, "ChildCreateRequest"),

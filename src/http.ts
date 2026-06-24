@@ -250,7 +250,10 @@ function buildRoutes(service: AppService): Route[] {
     route("GET", "/health", false, async () => service.healthCheck()),
     route("GET", "/health/ready", false, async () => service.healthCheck(true)),
     route("POST", "/api/auth/register", false, (ctx) =>
-      service.register(ctx.body.phone, ctx.body.password),
+      service.register(ctx.body.phone, ctx.body.password, ctx.body.relation),
+    ),
+    route("GET", "/api/auth/register-context", false, (ctx) =>
+      service.getRegisterContext(q(ctx).get("phone")),
     ),
     route("POST", "/api/auth/login", false, (ctx) =>
       service.login(ctx.body.phone, ctx.body.password),

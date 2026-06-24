@@ -17,13 +17,15 @@
 
 ## Auth And Family
 
-- `POST /api/auth/register` body `{ "phone": "13800138000", "password": "password123" }` returns `{ token, user, family }`
-- `POST /api/auth/login` body `{ "phone": "13800138000", "password": "password123" }` returns `{ token, user, family }`
+- `POST /api/auth/wechat-phone-login` body `{ "loginCode": "<wx-login-code>", "phoneCode": "<getPhoneNumber-code>" }` returns `{ token, user, family }`. Non-production may pass `{ "phone": "13800138000", "openid": "debug-openid" }` for local testing.
+- `GET /api/auth/register-context?phone=13900139000` returns `{ "phone": "13900139000", "invited": true, "relation": "father" }` when the phone number is already an invited family member; clients should lock the registration role to that value.
+- `POST /api/auth/register` body `{ "phone": "13800138000", "password": "password123", "relation": "mother" }` creates the first family member as `mother` or `father`; `relation` is optional and defaults to `mother`. If the phone number was already invited through `POST /api/family/members`, the server ignores the submitted `relation` and forces the invited member relation.
+- `POST /api/auth/login` is the legacy phone-password compatibility login endpoint.
 - `GET /api/auth/me`
 - `POST /api/auth/logout`
 - `POST /api/auth/wechat-session` body `{ "code": "<wx-login-code>" }` binds the current user to a WeChat openid. Non-production may pass `{ "openid": "debug-openid" }` for local testing.
 - `GET /api/family`
-- `GET /api/family/members`
+- `GET /api/family/members` returns members with `phone` and `status`; `status: "pending"` means the invited phone has not registered yet, and `status: "active"` means the member has completed registration.
 - `POST /api/family/members` body `{ "phone": "13900139000", "relation": "father" }`
 - `DELETE /api/family/members/:memberId`
 
@@ -31,6 +33,7 @@ Family sharing errors use stable `error.code` values for Flutter display:
 
 - `FAMILY_MEMBER_LIMIT_REACHED`: current family already has the MVP limit of 2 members.
 - `USER_ALREADY_IN_FAMILY`: the phone number already belongs to a user in the current family.
+- `USER_ALREADY_IN_OTHER_FAMILY`: the phone number already belongs to another family and cannot be invited into the current family.
 - `CANNOT_REMOVE_LAST_MEMBER`: the request would remove the final family member.
 - Removing a member invalidates that user's active sessions.
 
@@ -56,7 +59,7 @@ Family sharing errors use stable `error.code` values for Flutter display:
 
 ## Children
 
-- `POST /api/children` body `{ "name": "小宝", "age": 6, "avatarUrl": null }`
+- `POST /api/children` body `{ "name": "小宝", "gender": "female", "color": "#BE6B45", "age": 6, "avatarUrl": null }`; `gender` is optional and may be `male`, `female`, or `null`; `color` is optional and must be one of the configured child marker colors.
 - `GET /api/children?page=1&pageSize=20`
 - `GET /api/children/:childId`
 - `GET /api/children/:childId/classes`
@@ -104,6 +107,7 @@ Family sharing errors use stable `error.code` values for Flutter display:
   "institutionName": "星星美术",
   "className": "大班A",
   "courseName": "美术启蒙",
+  "icon": "palette",
   "teacherName": "王老师",
   "teacherPhone": "13800138000",
   "totalHours": 20,

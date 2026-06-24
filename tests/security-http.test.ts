@@ -112,6 +112,44 @@ describe("security and HTTP boundary", { concurrency: false }, () => {
     }
   });
 
+  it("logs in over HTTP with phone and password", async () => {
+    const app = await makeApp();
+    try {
+      await app.service.register("13800138004", "password123");
+      const { res, body } = await request(app, "/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify({
+          phone: "13800138004",
+          password: "password123",
+        }),
+      });
+      assert.equal(res.status, 200);
+      assert.equal(body.data.user.phone, "13800138004");
+      assert.ok(body.data.token);
+      assert.equal(body.data.family.members.length, 1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("rejects wrong password over HTTP", async () => {
+    const app = await makeApp();
+    try {
+      await app.service.register("13800138005", "password123");
+      const { res, body } = await request(app, "/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify({
+          phone: "13800138005",
+          password: "wrongpass",
+        }),
+      });
+      assert.equal(res.status, 401);
+      assert.equal(body.error.code, "UNAUTHORIZED");
+    } finally {
+      await app.close();
+    }
+  });
+
   it("rejects oversized request bodies with 413", async () => {
     const app = await makeApp({ MAX_BODY_BYTES: "16" });
     try {
@@ -125,4 +163,5 @@ describe("security and HTTP boundary", { concurrency: false }, () => {
       await app.close();
     }
   });
+
 });

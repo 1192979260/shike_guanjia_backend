@@ -1,21 +1,21 @@
 ## ADDED Requirements
 
 ### Requirement: Child profile can be created
-The system SHALL allow an authenticated family member to create a child profile with `name`, optional `age`, optional `avatarUrl`, and the authenticated family scope.
+The system SHALL allow an authenticated family member to create a child profile with `name`, optional `gender`, optional `color`, optional `age`, optional `avatarUrl`, and the authenticated family scope.
 
 #### Scenario: Valid child profile is created
-- **WHEN** an authenticated client submits a non-empty child name and valid optional age
+- **WHEN** an authenticated client submits a non-empty child name, valid optional gender, valid optional color, and valid optional age
 - **THEN** the system creates the child under the authenticated family and returns a `Child` JSON object
 
 #### Scenario: Invalid child profile is rejected
-- **WHEN** the child name is empty, longer than 50 characters, or age is outside 0 through 18
+- **WHEN** the child name is empty, longer than 50 characters, gender is not `male` or `female`, color is not a configured child marker color, or age is outside 0 through 18
 - **THEN** the system returns field validation errors and does not create the child
 
 ### Requirement: Child profile can be updated
 The system SHALL allow an authenticated family member to update only children belonging to the authenticated family.
 
 #### Scenario: Existing family child is updated
-- **WHEN** an authenticated client updates `name`, `age`, or `avatarUrl` for a child in its family with valid values
+- **WHEN** an authenticated client updates `name`, `gender`, `color`, `age`, or `avatarUrl` for a child in its family with valid values
 - **THEN** the system persists the changes and returns the updated `Child` JSON object
 
 #### Scenario: Cross-family child update is forbidden

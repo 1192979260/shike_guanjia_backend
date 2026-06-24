@@ -424,12 +424,16 @@ export class MysqlStore extends MemoryStore {
         id VARCHAR(191) NOT NULL PRIMARY KEY,
         family_id VARCHAR(191) NOT NULL,
         name VARCHAR(255) NOT NULL,
+        gender VARCHAR(16) NULL,
+        color VARCHAR(16) NULL,
         age INT NULL,
         avatar_url TEXT NULL,
         created_at VARCHAR(64) NOT NULL,
         INDEX idx_children_family_id (family_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
+    await this.addColumnIfMissing("children", "gender", "VARCHAR(16) NULL");
+    await this.addColumnIfMissing("children", "color", "VARCHAR(16) NULL");
     await this.pool.execute(`
       CREATE TABLE IF NOT EXISTS classes (
         id VARCHAR(191) NOT NULL PRIMARY KEY,
@@ -438,6 +442,7 @@ export class MysqlStore extends MemoryStore {
         institution_name VARCHAR(255) NOT NULL,
         class_name VARCHAR(255) NOT NULL,
         course_name VARCHAR(255) NOT NULL,
+        icon VARCHAR(64) NULL,
         teacher_name VARCHAR(255) NULL,
         teacher_phone VARCHAR(32) NULL,
         total_hours DOUBLE NOT NULL,
@@ -479,6 +484,7 @@ export class MysqlStore extends MemoryStore {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
     await this.addColumnIfMissing("classes", "historical_used_hours", "DOUBLE NULL");
+    await this.addColumnIfMissing("classes", "icon", "VARCHAR(64) NULL");
     await this.addColumnIfMissing("lessons", "source_type", "VARCHAR(32) NULL");
     await this.addColumnIfMissing("lessons", "attendance_status", "VARCHAR(64) NULL");
     await this.addColumnIfMissing("lessons", "change_status", "VARCHAR(32) NULL");
@@ -920,6 +926,8 @@ export class MysqlStore extends MemoryStore {
         normalizeStoredDates({
           id: row.id,
           name: row.name,
+          gender: row.gender,
+          color: row.color,
           age: row.age,
           avatarUrl: row.avatar_url,
           familyId: row.family_id,
@@ -943,6 +951,7 @@ export class MysqlStore extends MemoryStore {
           institutionName: row.institution_name,
           className: row.class_name,
           courseName: row.course_name,
+          icon: row.icon ?? null,
           teacherName: row.teacher_name,
           teacherPhone: row.teacher_phone,
           totalHours: Number(row.total_hours),
@@ -1363,11 +1372,13 @@ export class MysqlStore extends MemoryStore {
     if (collection === "children") {
       const item = value as Child;
       await db.execute(
-        `INSERT INTO children (id, family_id, name, age, avatar_url, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO children (id, family_id, name, gender, color, age, avatar_url, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            family_id = VALUES(family_id),
            name = VALUES(name),
+           gender = VALUES(gender),
+           color = VALUES(color),
            age = VALUES(age),
            avatar_url = VALUES(avatar_url),
            created_at = VALUES(created_at)`,
@@ -1375,6 +1386,8 @@ export class MysqlStore extends MemoryStore {
           item.id,
           item.familyId,
           item.name,
+          item.gender ?? null,
+          item.color ?? null,
           item.age ?? null,
           item.avatarUrl ?? null,
           item.createdAt,
@@ -1386,17 +1399,18 @@ export class MysqlStore extends MemoryStore {
       const item = value as TrainingClass;
       await db.execute(
         `INSERT INTO classes
-          (id, child_id, family_id, institution_name, class_name, course_name,
+          (id, child_id, family_id, institution_name, class_name, course_name, icon,
            teacher_name, teacher_phone, total_hours, historical_used_hours, used_hours,
            remaining_hours, total_fee, start_time, end_time, recurring_rule,
            status, created_at, updated_at, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            child_id = VALUES(child_id),
            family_id = VALUES(family_id),
            institution_name = VALUES(institution_name),
            class_name = VALUES(class_name),
            course_name = VALUES(course_name),
+           icon = VALUES(icon),
            teacher_name = VALUES(teacher_name),
            teacher_phone = VALUES(teacher_phone),
            total_hours = VALUES(total_hours),
@@ -1418,6 +1432,7 @@ export class MysqlStore extends MemoryStore {
           item.institutionName,
           item.className,
           item.courseName,
+          item.icon ?? null,
           item.teacherName ?? null,
           item.teacherPhone ?? null,
           item.totalHours,

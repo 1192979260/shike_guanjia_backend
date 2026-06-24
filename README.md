@@ -1,6 +1,6 @@
 # 课时管家 Backend
 
-TypeScript HTTP backend for the 课时管家 app family. It exposes REST JSON APIs for phone-password auth, family sharing, children, classes, lessons, attendance, leave, reminders, theme preferences, and cost reporting while preserving client-compatible `camelCase` fields, enum values, and ISO-8601 date strings.
+TypeScript HTTP backend for the 课时管家 app family. It exposes REST JSON APIs for WeChat phone authorization auth, family sharing, children, classes, lessons, attendance, leave, reminders, theme preferences, and cost reporting while preserving client-compatible `camelCase` fields, enum values, and ISO-8601 date strings.
 
 ## Quick Start
 
@@ -39,6 +39,9 @@ Default endpoints:
 | `LOGIN_LOCKOUT_MS` | `900000` (15m) | Lockout duration after too many failed logins. |
 | `LOGIN_ATTEMPT_WINDOW_MS` | `900000` | Window over which failed attempts accumulate. |
 | `MAX_BODY_BYTES` | `1048576` (1 MiB) | Maximum inbound request body size; 413 if exceeded. |
+| `UPLOAD_DIR` | `.data/uploads` | Directory used for uploaded avatar image files. |
+| `MAX_IMAGE_UPLOAD_BYTES` | `524288` (512 KiB) | Maximum decoded avatar image size. `MAX_BODY_BYTES` still applies to the JSON/base64 request body. |
+| `PUBLIC_BASE_URL` | unset | Optional public origin used when generating absolute upload URLs. Falls back to forwarded request headers. |
 | `MYSQL_CONNECTION_LIMIT` | `15` | MySQL pool size. |
 | `REMINDER_SCAN_INTERVAL_MS` | `60000` | Reminder scheduler interval. Runs are serialized (no overlap). |
 

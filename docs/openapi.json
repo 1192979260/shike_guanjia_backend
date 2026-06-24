@@ -3,7 +3,7 @@
   "info": {
     "title": "课时管家 Backend API",
     "version": "0.1.0",
-    "description": "Flutter 端联调用后端 API。认证使用手机号和密码。"
+    "description": "Flutter / 小程序端联调用后端 API。用户登录以微信手机号授权为主。"
   },
   "servers": [
     {
@@ -89,6 +89,44 @@
           }
         }
       },
+      "WeChatPhoneLoginRequest": {
+        "type": "object",
+        "required": [
+          "loginCode",
+          "phoneCode"
+        ],
+        "properties": {
+          "loginCode": {
+            "type": "string",
+            "description": "wx.login 返回的登录凭证 code"
+          },
+          "phoneCode": {
+            "type": "string",
+            "description": "getPhoneNumber 返回的手机号授权动态令牌"
+          },
+          "phone": {
+            "type": "string",
+            "description": "仅非生产环境允许直接传入，用于本地调试/测试"
+          },
+          "openid": {
+            "type": "string",
+            "description": "仅非生产环境允许直接传入，用于本地调试/测试"
+          }
+        }
+      },
+      "WeChatSessionRequest": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "微信登录凭证 code"
+          },
+          "openid": {
+            "type": "string",
+            "description": "仅非生产环境允许直接传入，用于调试/测试"
+          }
+        }
+      },
       "ChildCreateRequest": {
         "type": "object",
         "required": [
@@ -98,6 +136,28 @@
           "name": {
             "type": "string",
             "example": "小宝"
+          },
+          "gender": {
+            "type": "string",
+            "enum": [
+              "male",
+              "female"
+            ],
+            "nullable": true,
+            "example": "female"
+          },
+          "color": {
+            "type": "string",
+            "enum": [
+              "#BE6B45",
+              "#C49A42",
+              "#91A185",
+              "#6F7F62",
+              "#9B8170",
+              "#8A7A68"
+            ],
+            "nullable": true,
+            "example": "#BE6B45"
           },
           "age": {
             "type": "integer",
@@ -346,6 +406,11 @@
             "type": "string",
             "example": "美术启蒙"
           },
+          "icon": {
+            "type": "string",
+            "nullable": true,
+            "example": "palette"
+          },
           "teacherName": {
             "type": "string",
             "nullable": true,
@@ -491,6 +556,171 @@
           }
         }
       },
+      "ReminderSubscriptionRequest": {
+        "type": "object",
+        "required": [
+          "templateId",
+          "lessonIds"
+        ],
+        "properties": {
+          "templateId": {
+            "type": "string",
+            "description": "微信订阅消息模板 ID"
+          },
+          "advanceMinutes": {
+            "type": "integer",
+            "enum": [
+              15,
+              30,
+              60,
+              120,
+              1440
+            ]
+          },
+          "lessonIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "maxItems": 1
+          },
+          "page": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "LessonChangeRequest": {
+        "type": "object",
+        "required": [
+          "lessonId",
+          "type",
+          "newScheduledDate"
+        ],
+        "properties": {
+          "lessonId": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "leave",
+              "reschedule"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "student",
+              "teacher",
+              "institution",
+              "holiday",
+              "other"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "newScheduledDate": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "newScheduledEndDate": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        }
+      },
+      "LessonLeaveRequest": {
+        "type": "object",
+        "properties": {
+          "scheduledDate": {
+            "type": "string",
+            "format": "date-time",
+            "description": "补课时间，兼容旧前端字段"
+          },
+          "scheduledEndDate": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "newScheduledDate": {
+            "type": "string",
+            "format": "date-time",
+            "description": "补课时间"
+          },
+          "newScheduledEndDate": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "LessonRescheduleRequest": {
+        "type": "object",
+        "required": [
+          "newScheduledDate"
+        ],
+        "properties": {
+          "newScheduledDate": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "newScheduledEndDate": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "BackfillCheckInRequest": {
+        "type": "object",
+        "required": [
+          "lessonId"
+        ],
+        "properties": {
+          "lessonId": {
+            "type": "string"
+          },
+          "actualStartTime": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "actualEndTime": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "notes": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
       "LeaveRequest": {
         "type": "object",
         "required": [
@@ -561,6 +791,58 @@
           "Auth"
         ],
         "summary": "健康检查",
+        "security": [],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "深度健康检查",
         "security": [],
         "parameters": [],
         "responses": {
@@ -731,6 +1013,68 @@
         }
       }
     },
+    "/api/auth/wechat-phone-login": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "微信手机号授权登录",
+        "security": [],
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WeChatPhoneLoginRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/auth/me": {
       "get": {
         "tags": [
@@ -799,6 +1143,72 @@
           }
         ],
         "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/wechat-session": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "绑定微信 openid",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WeChatSessionRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "OK",
@@ -1204,6 +1614,72 @@
         }
       }
     },
+    "/api/reminder-subscriptions": {
+      "post": {
+        "tags": [
+          "Preferences"
+        ],
+        "summary": "登记微信订阅消息提醒",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReminderSubscriptionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/preferences/theme": {
       "get": {
         "tags": [
@@ -1335,7 +1811,24 @@
             "bearerAuth": []
           }
         ],
-        "parameters": [],
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "OK",
@@ -1736,6 +2229,22 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
             }
           }
         ],
@@ -2430,6 +2939,81 @@
         }
       }
     },
+    "/api/classes/{classId}/schedule-rule": {
+      "patch": {
+        "tags": [
+          "Classes"
+        ],
+        "summary": "更新班级排课规则",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "classId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClassCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/classes/{classId}/generate-lessons": {
       "post": {
         "tags": [
@@ -2495,12 +3079,142 @@
         }
       }
     },
+    "/api/classes/{classId}/regenerate-lessons": {
+      "post": {
+        "tags": [
+          "Classes"
+        ],
+        "summary": "重新生成课次（兼容别名）",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "classId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/classes/{classId}/lessons": {
       "get": {
         "tags": [
           "Lessons"
         ],
         "summary": "班级课次",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "classId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/classes/{classId}/lesson-change-records": {
+      "get": {
+        "tags": [
+          "Lessons"
+        ],
+        "summary": "班级调课/请假记录",
         "security": [
           {
             "bearerAuth": []
@@ -2668,6 +3382,22 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -2720,6 +3450,62 @@
           "Lessons"
         ],
         "summary": "今日课次",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/lessons/home": {
+      "get": {
+        "tags": [
+          "Lessons"
+        ],
+        "summary": "首页课次聚合",
         "security": [
           {
             "bearerAuth": []
@@ -3118,6 +3904,156 @@
         }
       }
     },
+    "/api/lessons/{lessonId}/reschedule": {
+      "post": {
+        "tags": [
+          "Lessons"
+        ],
+        "summary": "调整课次时间",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "lessonId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LessonRescheduleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/lessons/{lessonId}/leave": {
+      "post": {
+        "tags": [
+          "Leaves"
+        ],
+        "summary": "为课次请假并登记补课时间",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "lessonId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LessonLeaveRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/lessons/{lessonId}/conflicts": {
       "get": {
         "tags": [
@@ -3380,6 +4316,72 @@
         }
       }
     },
+    "/api/lessons/backfill-check-in": {
+      "post": {
+        "tags": [
+          "Attendance"
+        ],
+        "summary": "课次补录打卡",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BackfillCheckInRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/attendance/lessons/{lessonId}/cancel": {
       "post": {
         "tags": [
@@ -3495,6 +4497,22 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
             }
           }
         ],
@@ -3744,6 +4762,307 @@
         }
       }
     },
+    "/api/lesson-changes": {
+      "post": {
+        "tags": [
+          "Lessons"
+        ],
+        "summary": "创建调课/请假变更",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LessonChangeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/lesson-changes/history": {
+      "get": {
+        "tags": [
+          "Lessons"
+        ],
+        "summary": "调课/请假历史",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "childId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "classId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "startDate",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endDate",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/lesson-changes/{changeId}/cancel": {
+      "post": {
+        "tags": [
+          "Lessons"
+        ],
+        "summary": "取消调课/请假变更",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "changeId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/lesson-change-records/{changeId}/revoke": {
+      "post": {
+        "tags": [
+          "Lessons"
+        ],
+        "summary": "撤销调课/请假记录（兼容别名）",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "changeId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/leaves": {
       "post": {
         "tags": [
@@ -3844,6 +5163,22 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
             }
           }
         ],

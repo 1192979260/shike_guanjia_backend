@@ -1,4 +1,5 @@
 export type FamilyRelation = 'mother' | 'father';
+export type FamilyMemberStatus = 'pending' | 'active';
 export type ClassStatus = 'active' | 'paused' | 'ended';
 export type RecurringRuleType = 'weekly' | 'monthly' | 'custom';
 export type LessonStatus = 'scheduled' | 'completed' | 'leave' | 'rescheduled' | 'cancelled';
@@ -12,6 +13,8 @@ export type LessonChangeLifecycleStatus = 'active' | 'cancelled';
 export type LessonChangeStatus = 'normal' | 'leave' | 'rescheduled' | 'cancelled';
 export type ThemeSkin = 'warm' | 'fresh' | 'classic';
 export type ReminderSubscriptionStatus = 'pending' | 'processing' | 'sent' | 'failed' | 'cancelled';
+export type ChildGender = 'male' | 'female';
+export type ChildColor = '#BE6B45' | '#C49A42' | '#91A185' | '#6F7F62' | '#9B8170' | '#8A7A68';
 
 export interface User {
   id: string;
@@ -26,6 +29,8 @@ export interface FamilyMember {
   id: string;
   userId: string;
   relation: FamilyRelation;
+  phone?: string;
+  status?: FamilyMemberStatus;
   displayName?: string | null;
   createdAt: string;
 }
@@ -39,6 +44,8 @@ export interface Family {
 export interface Child {
   id: string;
   name: string;
+  gender?: ChildGender | null;
+  color?: ChildColor | null;
   age?: number | null;
   avatarUrl?: string | null;
   familyId: string;
@@ -68,6 +75,7 @@ export interface TrainingClass {
   institutionName: string;
   className: string;
   courseName: string;
+  icon?: string | null;
   teacherName?: string | null;
   teacherPhone?: string | null;
   totalHours: number;
